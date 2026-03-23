@@ -12,9 +12,7 @@ app = FastAPI(title="Super Connector API")
 
 @app.on_event("startup")
 async def startup():
-    init_db()
-
-# ── Models ──────────────────────────────────────────────────────────────────
+    await init_db()
 
 class ContactPayload(BaseModel):
     contact_id: str
@@ -37,32 +35,28 @@ class DraftPayload(BaseModel):
     contact_a_id: str
     contact_b_id: str
 
-# ── Routes ───────────────────────────────────────────────────────────────────
-
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
 @app.post("/contact")
-def upsert_contact(payload: ContactPayload):
-    """Embed a single contact and store/update in pgvector."""
+async def upsert_contact(payload: ContactPayload):
     try:
         profile_text = _build_profile_text(payload)
         vector = embed_profile(profile_text)
-        store_contact(payload.contact_id, payload.dict(), vector)
+        await store_contact(payload.contact_id, payload.dict(), vector)
         return {"success": True, "contact_id": payload.contact_id}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/contact/bulk")
-def bulk_upsert(payload: BulkPayload):
-    """Embed and store all contacts — used for retroactive vectorization."""
+async def bulk_upsert(payload: BulkPayload):
     results = {"success": 0, "skipped": 0, "errors": []}
     for contact in payload.contacts:
         try:
             profile_text = _build_profile_text(contact)
             vector = embed_profile(profile_text)
-            store_contact(contact.contact_id, contact.dict(), vector)
+            await store_contact(contact.contact_id, contact.dict(), vector)
             results["success"] += 1
         except Exception as e:
             results["errors"].append({"contact_id": contact.contact_id, "error": str(e)})
@@ -70,19 +64,17 @@ def bulk_upsert(payload: BulkPayload):
     return results
 
 @app.put("/contact/{contact_id}")
-def update_contact(contact_id: str, payload: ContactPayload):
-    """Re-embed a contact after profile update."""
+async def update_contact(contact_id: str, payload: ContactPayload):
     try:
         profile_text = _build_profile_text(payload)
         vector = embed_profile(profile_text)
-        store_contact(contact_id, payload.dict(), vector)
+        await store_contact(contact_id, payload.dict(), vector)
         return {"success": True, "contact_id": contact_id}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/match/{contact_id}")
-def match_contact(contact_id: str, limit: int = 5):
-    """Find top N semantically similar contacts."""
+async def match_contact(contact_id: str, limit: int = 5):
     try:
         matches = find_matches(contact_id, limit=limit)
         if matches is None:
@@ -94,11 +86,10 @@ def match_contact(contact_id: str, limit: int = 5):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/draft")
-def draft_intro_email(payload: DraftPayload):
-    """Given two contact IDs, retrieve their profiles and draft an intro email."""
+async def draft_intro_email(payload: DraftPayload):
     try:
-        contact_a = get_contact(payload.contact_a_id)
-        contact_b = get_contact(payload.contact_b_id)
+        contact_a = await get_contact(payload.contact_a_id)
+        contact_b = await get_contact(payload.contact_b_id)
         if not contact_a or not contact_b:
             raise HTTPException(status_code=404, detail="One or both contacts not found")
         result = draft_intro(contact_a, contact_b)
@@ -108,10 +99,7 @@ def draft_intro_email(payload: DraftPayload):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# ── Helpers ──────────────────────────────────────────────────────────────────
-
 def _build_profile_text(contact: ContactPayload) -> str:
-    """Build a rich text string from a contact profile for embedding."""
     parts = [
         f"Name: {contact.full_name}",
         f"Role: {contact.title_role}" if contact.title_role else "",

@@ -1,105 +1,102 @@
 import os
 import json
-import psycopg2
-from psycopg2.extras import RealDictCursor
+import asyncpg
+from pgvector.asyncpg import register_vector
 
 DATABASE_URL = os.environ["DATABASE_URL"]
 
-def _conn():
-    return psycopg2.connect(DATABASE_URL, sslmode="require")
+async def _conn():
+    conn = await asyncpg.connect(DATABASE_URL, ssl="require")
+    await register_vector(conn)
+    return conn
 
-def init_db():
-    """Create the contacts table with pgvector column if it doesn't exist."""
-    with _conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("CREATE EXTENSION IF NOT EXISTS vector;")
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS contacts (
-                    contact_id TEXT PRIMARY KEY,
-                    profile JSONB NOT NULL,
-                    embedding vector(1024),
-                    updated_at TIMESTAMP DEFAULT NOW()
-                );
-            """)
-            cur.execute("""
-                CREATE INDEX IF NOT EXISTS contacts_embedding_idx
-                ON contacts USING ivfflat (embedding vector_cosine_ops)
-                WITH (lists = 100);
-            """)
-        conn.commit()
+async def init_db():
+    conn = await _conn()
+    try:
+        await conn.execute("CREATE EXTENSION IF NOT EXISTS vector;")
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS contacts (
+                contact_id TEXT PRIMARY KEY,
+                profile JSONB NOT NULL,
+                embedding vector(1024),
+                updated_at TIMESTAMP DEFAULT NOW()
+            );
+        """)
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS contacts_embedding_idx
+            ON contacts USING ivfflat (embedding vector_cosine_ops)
+            WITH (lists = 100);
+        """)
+    finally:
+        await conn.close()
 
-def store_contact(contact_id: str, profile: dict, vector: list):
-    """Insert or update a contact with its embedding."""
-    with _conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                INSERT INTO contacts (contact_id, profile, embedding, updated_at)
-                VALUES (%s, %s, %s, NOW())
-                ON CONFLICT (contact_id)
-                DO UPDATE SET
-                    profile = EXCLUDED.profile,
-                    embedding = EXCLUDED.embedding,
-                    updated_at = NOW();
-            """, (contact_id, json.dumps(profile), vector))
-        conn.commit()
+async def store_contact(contact_id: str, profile: dict, vector: list):
+    conn = await _conn()
+    try:
+        import numpy as np
+        await conn.execute("""
+            INSERT INTO contacts (contact_id, profile, embedding, updated_at)
+            VALUES ($1, $2, $3, NOW())
+            ON CONFLICT (contact_id)
+            DO UPDATE SET
+                profile = EXCLUDED.profile,
+                embedding = EXCLUDED.embedding,
+                updated_at = NOW();
+        """, contact_id, json.dumps(profile), np.array(vector))
+    finally:
+        await conn.close()
 
-def get_contact(contact_id: str) -> dict | None:
-    """Retrieve a single contact's profile by ID."""
-    with _conn() as conn:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute(
-                "SELECT profile FROM contacts WHERE contact_id = %s",
-                (contact_id,)
-            )
-            row = cur.fetchone()
-            return dict(row["profile"]) if row else None
+async def get_contact(contact_id: str):
+    conn = await _conn()
+    try:
+        row = await conn.fetchrow(
+            "SELECT profile FROM contacts WHERE contact_id = $1", contact_id
+        )
+        return json.loads(row["profile"]) if row else None
+    finally:
+        await conn.close()
 
-def get_all_contacts() -> list[dict]:
-    """Retrieve all contact profiles (no vectors)."""
-    with _conn() as conn:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("SELECT contact_id, profile FROM contacts ORDER BY updated_at DESC")
-            return [{"contact_id": r["contact_id"], **dict(r["profile"])} for r in cur.fetchall()]
+async def get_all_contacts():
+    conn = await _conn()
+    try:
+        rows = await conn.fetch("SELECT contact_id, profile FROM contacts ORDER BY updated_at DESC")
+        return [{"contact_id": r["contact_id"], **json.loads(r["profile"])} for r in rows]
+    finally:
+        await conn.close()
 
-def delete_contact(contact_id: str):
-    """Remove a contact from the vector DB."""
-    with _conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("DELETE FROM contacts WHERE contact_id = %s", (contact_id,))
-        conn.commit()
+async def delete_contact(contact_id: str):
+    conn = await _conn()
+    try:
+        await conn.execute("DELETE FROM contacts WHERE contact_id = $1", contact_id)
+    finally:
+        await conn.close()
 
-def find_similar(contact_id: str, limit: int = 5) -> list[dict] | None:
-    """Find the most semantically similar contacts using cosine distance."""
-    with _conn() as conn:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            # Get the source contact's embedding
-            cur.execute(
-                "SELECT embedding FROM contacts WHERE contact_id = %s",
-                (contact_id,)
-            )
-            row = cur.fetchone()
-            if not row:
-                return None
-
-            embedding = row["embedding"]
-
-            # Find closest neighbours, excluding the source contact itself
-            cur.execute("""
-                SELECT
-                    contact_id,
-                    profile,
-                    1 - (embedding <=> %s::vector) AS similarity
-                FROM contacts
-                WHERE contact_id != %s
-                ORDER BY embedding <=> %s::vector
-                LIMIT %s;
-            """, (embedding, contact_id, embedding, limit))
-
-            return [
-                {
-                    "contact_id": r["contact_id"],
-                    "similarity": round(float(r["similarity"]), 4),
-                    **dict(r["profile"])
-                }
-                for r in cur.fetchall()
-            ]
+async def find_similar(contact_id: str, limit: int = 5):
+    conn = await _conn()
+    try:
+        row = await conn.fetchrow(
+            "SELECT embedding FROM contacts WHERE contact_id = $1", contact_id
+        )
+        if not row:
+            return None
+        embedding = row["embedding"]
+        rows = await conn.fetch("""
+            SELECT
+                contact_id,
+                profile,
+                1 - (embedding <=> $1::vector) AS similarity
+            FROM contacts
+            WHERE contact_id != $2
+            ORDER BY embedding <=> $1::vector
+            LIMIT $3;
+        """, embedding, contact_id, limit)
+        return [
+            {
+                "contact_id": r["contact_id"],
+                "similarity": round(float(r["similarity"]), 4),
+                **json.loads(r["profile"])
+            }
+            for r in rows
+        ]
+    finally:
+        await conn.close()
