@@ -1,4 +1,4 @@
-import os
+﻿import os
 import json
 import asyncpg
 from pgvector.asyncpg import register_vector
@@ -14,7 +14,7 @@ async def init_db():
     conn = await _conn()
     try:
         await conn.execute("CREATE EXTENSION IF NOT EXISTS vector;")
-	await conn.execute("DROP TABLE IF EXISTS contacts;")
+        await conn.execute("DROP TABLE IF EXISTS contacts;")
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS contacts (
                 contact_id TEXT PRIMARY KEY,
@@ -37,7 +37,7 @@ async def store_contact(contact_id: str, profile: dict, vector: list):
         import numpy as np
         await conn.execute("""
             INSERT INTO contacts (contact_id, profile, embedding, updated_at)
-            VALUES ($1, $2, $3, NOW())
+            VALUES (, , , NOW())
             ON CONFLICT (contact_id)
             DO UPDATE SET
                 profile = EXCLUDED.profile,
@@ -51,7 +51,7 @@ async def get_contact(contact_id: str):
     conn = await _conn()
     try:
         row = await conn.fetchrow(
-            "SELECT profile FROM contacts WHERE contact_id = $1", contact_id
+            "SELECT profile FROM contacts WHERE contact_id = ", contact_id
         )
         return json.loads(row["profile"]) if row else None
     finally:
@@ -68,7 +68,7 @@ async def get_all_contacts():
 async def delete_contact(contact_id: str):
     conn = await _conn()
     try:
-        await conn.execute("DELETE FROM contacts WHERE contact_id = $1", contact_id)
+        await conn.execute("DELETE FROM contacts WHERE contact_id = ", contact_id)
     finally:
         await conn.close()
 
@@ -76,7 +76,7 @@ async def find_similar(contact_id: str, limit: int = 5):
     conn = await _conn()
     try:
         row = await conn.fetchrow(
-            "SELECT embedding FROM contacts WHERE contact_id = $1", contact_id
+            "SELECT embedding FROM contacts WHERE contact_id = ", contact_id
         )
         if not row:
             return None
@@ -85,11 +85,11 @@ async def find_similar(contact_id: str, limit: int = 5):
             SELECT
                 contact_id,
                 profile,
-                1 - (embedding <=> $1::vector) AS similarity
+                1 - (embedding <=> ::vector) AS similarity
             FROM contacts
-            WHERE contact_id != $2
-            ORDER BY embedding <=> $1::vector
-            LIMIT $3;
+            WHERE contact_id != 
+            ORDER BY embedding <=> ::vector
+            LIMIT ;
         """, embedding, contact_id, limit)
         return [
             {

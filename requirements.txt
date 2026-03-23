@@ -5,3 +5,4 @@ pgvector==0.3.6
 voyageai==0.3.7
 anthropic==0.34.0
 pydantic==2.8.2
+numpy==1.26.4
