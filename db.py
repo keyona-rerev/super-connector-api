@@ -14,7 +14,6 @@ async def init_db():
     conn = await _conn()
     try:
         await conn.execute("CREATE EXTENSION IF NOT EXISTS vector;")
-        await conn.execute("DROP TABLE IF EXISTS contacts;")
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS contacts (
                 contact_id TEXT PRIMARY KEY,
