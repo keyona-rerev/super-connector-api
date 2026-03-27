@@ -35,6 +35,10 @@ class DraftPayload(BaseModel):
     contact_a_id: str
     contact_b_id: str
 
+class SearchRequest(BaseModel):
+    query: str
+    top_k: Optional[int] = 10
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
@@ -96,6 +100,15 @@ async def draft_intro_email(payload: DraftPayload):
         return {"success": True, "draft": result}
     except HTTPException:
         raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/search")
+async def search_contacts(request: SearchRequest):
+    try:
+        vector = embed_profile(request.query)
+        matches = find_matches_by_vector(vector, limit=request.top_k)
+        return {"query": request.query, "results": matches}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
