@@ -1,4 +1,4 @@
-﻿import os
+import os
 import json
 import asyncpg
 from pgvector.asyncpg import register_vector
@@ -91,6 +91,31 @@ async def find_similar(contact_id: str, limit: int = 5):
             ORDER BY embedding <=> $1::vector
             LIMIT $3;
         """, embedding, contact_id, limit)
+        return [
+            {
+                "contact_id": r["contact_id"],
+                "similarity": round(float(r["similarity"]), 4),
+                **json.loads(r["profile"])
+            }
+            for r in rows
+        ]
+    finally:
+        await conn.close()
+
+async def find_similar_by_vector(vector: list, limit: int = 10):
+    import numpy as np
+    conn = await _conn()
+    try:
+        rows = await conn.fetch("""
+            SELECT
+                contact_id,
+                profile,
+                1 - (embedding <=> $1::vector) AS similarity
+            FROM contacts
+            WHERE embedding IS NOT NULL
+            ORDER BY embedding <=> $1::vector
+            LIMIT $2;
+        """, np.array(vector), limit)
         return [
             {
                 "contact_id": r["contact_id"],
