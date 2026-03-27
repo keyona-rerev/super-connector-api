@@ -125,11 +125,3 @@ def _build_profile_text(contact: ContactPayload) -> str:
         f"Notes: {contact.notes}" if contact.notes else "",
     ]
     return " | ".join(p for p in parts if p)
-```
-
----
-
-Update all three files in GitHub, commit to main, and Railway will auto-deploy. Once it's live, test with:
-```
-POST https://super-connector-api-production.up.railway.app/search
-{"query": "philanthropy strategy advisor Africa leadership", "top_k": 10}
