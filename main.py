@@ -5,7 +5,7 @@ import os
 
 from db import init_db, store_contact, get_contact, get_all_contacts, delete_contact
 from embedder import embed_profile
-from matcher import find_matches
+from matcher import find_matches, find_matches_by_vector
 from drafter import draft_intro
 
 app = FastAPI(title="Super Connector API")
@@ -107,8 +107,8 @@ async def draft_intro_email(payload: DraftPayload):
 async def search_contacts(request: SearchRequest):
     try:
         vector = embed_profile(request.query)
-        matches = find_matches_by_vector(vector, limit=request.top_k)
-        return {"query": request.query, "results": matches}
+        results = find_matches_by_vector(vector, limit=request.top_k)
+        return {"query": request.query, "results": results}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -125,3 +125,11 @@ def _build_profile_text(contact: ContactPayload) -> str:
         f"Notes: {contact.notes}" if contact.notes else "",
     ]
     return " | ".join(p for p in parts if p)
+```
+
+---
+
+Update all three files in GitHub, commit to main, and Railway will auto-deploy. Once it's live, test with:
+```
+POST https://super-connector-api-production.up.railway.app/search
+{"query": "philanthropy strategy advisor Africa leadership", "top_k": 10}
