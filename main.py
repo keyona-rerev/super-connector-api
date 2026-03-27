@@ -107,7 +107,7 @@ async def draft_intro_email(payload: DraftPayload):
 async def search_contacts(request: SearchRequest):
     try:
         vector = embed_profile(request.query)
-        results = find_matches_by_vector(vector, limit=request.top_k)
+        results = await find_matches_by_vector(vector, limit=request.top_k)
         return {"query": request.query, "results": results}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
