@@ -56,10 +56,13 @@ async def get_contact(contact_id: str):
     finally:
         await conn.close()
 
-async def get_all_contacts():
+async def get_all_contacts(limit: int = 50, offset: int = 0):
     conn = await _conn()
     try:
-        rows = await conn.fetch("SELECT contact_id, profile FROM contacts ORDER BY updated_at DESC")
+        rows = await conn.fetch(
+            "SELECT contact_id, profile FROM contacts ORDER BY updated_at DESC LIMIT $1 OFFSET $2",
+            limit, offset
+        )
         return [{"contact_id": r["contact_id"], **json.loads(r["profile"])} for r in rows]
     finally:
         await conn.close()
