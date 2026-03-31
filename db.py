@@ -107,6 +107,41 @@ async def init_db():
             ON action_items (stakeholder_id);
         """)
 
+        # Content Registry — vectorized so assets are semantically searchable
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS content (
+                content_id TEXT PRIMARY KEY,
+                data JSONB NOT NULL,
+                embedding vector(512),
+                updated_at TIMESTAMP DEFAULT NOW()
+            );
+        """)
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS content_embedding_idx
+            ON content USING ivfflat (embedding vector_cosine_ops)
+            WITH (lists = 10);
+        """)
+
+        # Follow-Ups — vectorized so follow-ups are semantically searchable
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS follow_ups (
+                follow_up_id TEXT PRIMARY KEY,
+                contact_id TEXT,
+                data JSONB NOT NULL,
+                embedding vector(512),
+                updated_at TIMESTAMP DEFAULT NOW()
+            );
+        """)
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS follow_ups_contact_idx
+            ON follow_ups (contact_id);
+        """)
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS follow_ups_embedding_idx
+            ON follow_ups USING ivfflat (embedding vector_cosine_ops)
+            WITH (lists = 10);
+        """)
+
     finally:
         await conn.close()
 
@@ -428,5 +463,179 @@ async def delete_action_item(action_id: str):
     conn = await _conn()
     try:
         await conn.execute("DELETE FROM action_items WHERE action_id = $1", action_id)
+    finally:
+        await conn.close()
+
+# ── CONTENT ───────────────────────────────────────────────────────────────────
+
+async def store_content(content_id: str, data: dict, vector: list):
+    """Upsert a content asset with its embedding."""
+    import numpy as np
+    conn = await _conn()
+    try:
+        await conn.execute("""
+            INSERT INTO content (content_id, data, embedding, updated_at)
+            VALUES ($1, $2, $3, NOW())
+            ON CONFLICT (content_id)
+            DO UPDATE SET
+                data = EXCLUDED.data,
+                embedding = EXCLUDED.embedding,
+                updated_at = NOW();
+        """, content_id, json.dumps(data), np.array(vector))
+    finally:
+        await conn.close()
+
+async def get_content(content_id: str):
+    conn = await _conn()
+    try:
+        row = await conn.fetchrow(
+            "SELECT data FROM content WHERE content_id = $1", content_id
+        )
+        return json.loads(row["data"]) if row else None
+    finally:
+        await conn.close()
+
+async def get_all_content():
+    conn = await _conn()
+    try:
+        rows = await conn.fetch(
+            "SELECT content_id, data FROM content ORDER BY updated_at DESC"
+        )
+        return [{"content_id": r["content_id"], **json.loads(r["data"])} for r in rows]
+    finally:
+        await conn.close()
+
+async def search_content_by_vector(vector: list, limit: int = 10):
+    """Semantic search across content assets — e.g. 'Prismm community bank article'."""
+    import numpy as np
+    conn = await _conn()
+    try:
+        rows = await conn.fetch("""
+            SELECT content_id, data,
+                   1 - (embedding <=> $1::vector) AS similarity
+            FROM content
+            WHERE embedding IS NOT NULL
+            ORDER BY embedding <=> $1::vector
+            LIMIT $2;
+        """, np.array(vector), limit)
+        return [
+            {"content_id": r["content_id"], "similarity": round(float(r["similarity"]), 4),
+             **json.loads(r["data"])}
+            for r in rows
+        ]
+    finally:
+        await conn.close()
+
+async def delete_content(content_id: str):
+    conn = await _conn()
+    try:
+        await conn.execute("DELETE FROM content WHERE content_id = $1", content_id)
+    finally:
+        await conn.close()
+
+# ── FOLLOW-UPS ────────────────────────────────────────────────────────────────
+
+async def store_follow_up(follow_up_id: str, contact_id: str, data: dict, vector: list):
+    """Upsert a follow-up with its embedding."""
+    import numpy as np
+    conn = await _conn()
+    try:
+        await conn.execute("""
+            INSERT INTO follow_ups (follow_up_id, contact_id, data, embedding, updated_at)
+            VALUES ($1, $2, $3, $4, NOW())
+            ON CONFLICT (follow_up_id)
+            DO UPDATE SET
+                contact_id = EXCLUDED.contact_id,
+                data = EXCLUDED.data,
+                embedding = EXCLUDED.embedding,
+                updated_at = NOW();
+        """, follow_up_id, contact_id or "", json.dumps(data), np.array(vector))
+    finally:
+        await conn.close()
+
+async def get_follow_up(follow_up_id: str):
+    conn = await _conn()
+    try:
+        row = await conn.fetchrow(
+            "SELECT data FROM follow_ups WHERE follow_up_id = $1", follow_up_id
+        )
+        return json.loads(row["data"]) if row else None
+    finally:
+        await conn.close()
+
+async def get_open_follow_ups():
+    """All follow-ups with status = Open — used by Phoebe Monday scan."""
+    conn = await _conn()
+    try:
+        rows = await conn.fetch("""
+            SELECT follow_up_id, contact_id, data FROM follow_ups
+            WHERE data->>'status' = 'Open'
+            ORDER BY data->>'next_action_date' ASC NULLS LAST
+        """)
+        return [
+            {"follow_up_id": r["follow_up_id"], "contact_id": r["contact_id"],
+             **json.loads(r["data"])}
+            for r in rows
+        ]
+    finally:
+        await conn.close()
+
+async def get_overdue_follow_ups(as_of_date: str):
+    """Follow-ups where next_action_date has passed and status is still Open."""
+    conn = await _conn()
+    try:
+        rows = await conn.fetch("""
+            SELECT follow_up_id, contact_id, data FROM follow_ups
+            WHERE data->>'status' = 'Open'
+            AND data->>'next_action_date' IS NOT NULL
+            AND data->>'next_action_date' != ''
+            AND data->>'next_action_date' < $1
+            ORDER BY data->>'next_action_date' ASC
+        """, as_of_date)
+        return [
+            {"follow_up_id": r["follow_up_id"], "contact_id": r["contact_id"],
+             **json.loads(r["data"])}
+            for r in rows
+        ]
+    finally:
+        await conn.close()
+
+async def get_follow_ups_for_contact(contact_id: str):
+    conn = await _conn()
+    try:
+        rows = await conn.fetch(
+            "SELECT follow_up_id, data FROM follow_ups WHERE contact_id = $1 ORDER BY updated_at DESC",
+            contact_id
+        )
+        return [{"follow_up_id": r["follow_up_id"], **json.loads(r["data"])} for r in rows]
+    finally:
+        await conn.close()
+
+async def search_follow_ups_by_vector(vector: list, limit: int = 10):
+    """Semantic search — e.g. 'who do I owe a follow-up about climate tech?'"""
+    import numpy as np
+    conn = await _conn()
+    try:
+        rows = await conn.fetch("""
+            SELECT follow_up_id, contact_id, data,
+                   1 - (embedding <=> $1::vector) AS similarity
+            FROM follow_ups
+            WHERE embedding IS NOT NULL
+            ORDER BY embedding <=> $1::vector
+            LIMIT $2;
+        """, np.array(vector), limit)
+        return [
+            {"follow_up_id": r["follow_up_id"], "contact_id": r["contact_id"],
+             "similarity": round(float(r["similarity"]), 4),
+             **json.loads(r["data"])}
+            for r in rows
+        ]
+    finally:
+        await conn.close()
+
+async def delete_follow_up(follow_up_id: str):
+    conn = await _conn()
+    try:
+        await conn.execute("DELETE FROM follow_ups WHERE follow_up_id = $1", follow_up_id)
     finally:
         await conn.close()
