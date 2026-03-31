@@ -100,3 +100,49 @@ class ActionItemStatusUpdate(BaseModel):
     status: str
     completed_date: Optional[str] = None
     google_task_id: Optional[str] = None
+
+
+# ── CONTENT ───────────────────────────────────────────────────────────────────
+
+class ContentPayload(BaseModel):
+    content_id: Optional[str] = None           # auto-generated if omitted (e.g. C001)
+    content_name: str
+    content_type: Optional[str] = ""           # Article / Campaign Concept / Gifting Moment /
+                                               # Sequence Variant / Data Drop / Collab Hook /
+                                               # Case Study / Demo / Newsletter Issue / Event Recap
+    venture: Optional[str] = ""               # ReRev Labs / Prismm / Black Tech Capital / Sekhmetic
+    initiative_tags: Optional[str] = ""       # Comma-separated project IDs e.g. "P008, P017"
+    status: Optional[str] = "Idea"            # Idea / Draft / In Review / Active / Archived
+    activation_angle: Optional[str] = ""      # What this content is meant to do / who it's for
+    asset_link: Optional[str] = ""            # Google Doc, Notion, Drive link
+    approval_required: Optional[str] = "No"  # Yes / No
+    prismm_sync: Optional[str] = ""          # Pending / Synced / Needs Update / blank for non-Prismm
+    notes: Optional[str] = ""
+
+
+class ContentStatusUpdate(BaseModel):
+    status: str
+    prismm_sync: Optional[str] = None
+
+
+# ── FOLLOW-UPS ────────────────────────────────────────────────────────────────
+
+class FollowUpPayload(BaseModel):
+    follow_up_id: Optional[str] = None        # auto-generated if omitted
+    contact_name: str
+    contact_id: Optional[str] = ""            # FK to contacts table
+    meeting_name: Optional[str] = ""          # Which meeting triggered this follow-up
+    meeting_date: Optional[str] = None        # ISO date string
+    next_action: Optional[str] = ""           # What needs to happen e.g. "Send deck", "Intro to Martha"
+    next_action_date: Optional[str] = None    # ISO date string — when it should happen by
+    venture: Optional[str] = ""               # Which venture this follow-up is under
+    transcript_link: Optional[str] = ""       # Link to the meeting transcript Google Doc
+    draft_link: Optional[str] = ""            # Link to the Gmail draft if one was created
+    status: Optional[str] = "Open"            # Open / Done / Overdue / Cancelled
+    completed_date: Optional[str] = None      # ISO date string — when it was marked Done
+    notes: Optional[str] = ""
+
+
+class FollowUpStatusUpdate(BaseModel):
+    status: str
+    completed_date: Optional[str] = None
