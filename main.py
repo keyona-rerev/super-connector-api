@@ -23,6 +23,11 @@ from db import (
     # action items
     upsert_action_item, get_action_items_for_initiative,
     get_open_action_items, get_action_item_by_google_task_id, delete_action_item,
+    # content
+    store_content, get_content, get_all_content, search_content_by_vector, delete_content,
+    # follow-ups
+    store_follow_up, get_follow_up, get_open_follow_ups, get_overdue_follow_ups,
+    get_follow_ups_for_contact, search_follow_ups_by_vector, delete_follow_up,
 )
 from embedder import embed_profile
 from matcher import find_matches, find_matches_by_vector
@@ -33,6 +38,8 @@ from models import (
     StakeholderPayload, StakeholderEngagementUpdate,
     ActivationAnglePayload,
     ActionItemPayload, ActionItemStatusUpdate,
+    ContentPayload, ContentStatusUpdate,
+    FollowUpPayload, FollowUpStatusUpdate,
 )
 
 app = FastAPI(title="Super Connector API")
@@ -127,7 +134,6 @@ async def get_contact_by_id(contact_id: str):
     contact = await get_contact(contact_id)
     if not contact:
         raise HTTPException(status_code=404, detail="Contact not found")
-    # Also pull stakeholder links for cross-initiative context
     stakeholder_links = await get_stakeholders_for_contact(contact_id)
     return {"success": True, "data": contact, "initiative_links": stakeholder_links}
 
@@ -287,9 +293,6 @@ async def create_stakeholder(payload: StakeholderPayload):
 
 @app.patch("/stakeholder/{stakeholder_id}/engagement", dependencies=[Depends(require_api_key)])
 async def update_stakeholder_engagement(stakeholder_id: str, payload: StakeholderEngagementUpdate):
-    """Quick update for engagement status after a meeting or outreach."""
-    conn_data = await get_stakeholders_for_contact("")  # placeholder — fetch by ID below
-    # Re-fetch directly
     from db import _conn
     import json as _json
     conn = await _conn()
@@ -349,7 +352,6 @@ async def remove_activation_angle(angle_id: str):
 
 @app.get("/action-items", dependencies=[Depends(require_api_key)])
 async def list_open_action_items(due_before: Optional[str] = None):
-    """Used by Phoebe for check-ins. due_before = ISO date string e.g. 2026-04-04"""
     data = await get_open_action_items(due_before=due_before)
     return {"success": True, "data": data, "count": len(data)}
 
@@ -385,7 +387,6 @@ async def update_action_item(action_id: str, payload: ActionItemPayload):
 
 @app.patch("/action-item/{action_id}/status", dependencies=[Depends(require_api_key)])
 async def update_action_item_status(action_id: str, payload: ActionItemStatusUpdate):
-    """Quick status update — used by Google Tasks sync and Phoebe reply processing."""
     from db import _conn
     import json as _json
     conn = await _conn()
@@ -409,7 +410,6 @@ async def update_action_item_status(action_id: str, payload: ActionItemStatusUpd
 
 @app.get("/action-item/by-google-task/{google_task_id}", dependencies=[Depends(require_api_key)])
 async def get_by_google_task_id(google_task_id: str):
-    """Two-way Google Tasks sync lookup."""
     data = await get_action_item_by_google_task_id(google_task_id)
     if not data:
         raise HTTPException(status_code=404, detail="No action item found for this Google Task ID")
@@ -420,7 +420,222 @@ async def remove_action_item(action_id: str):
     await delete_action_item(action_id)
     return {"success": True}
 
+# ════════════════════════════════════════════════════════════════════════════
+# CONTENT
+# ════════════════════════════════════════════════════════════════════════════
+
+@app.get("/content", dependencies=[Depends(require_api_key)])
+async def list_content():
+    """List all content assets."""
+    data = await get_all_content()
+    return {"success": True, "data": data, "count": len(data)}
+
+@app.get("/content/{content_id}", dependencies=[Depends(require_api_key)])
+async def get_content_by_id(content_id: str):
+    data = await get_content(content_id)
+    if not data:
+        raise HTTPException(status_code=404, detail="Content not found")
+    return {"success": True, "data": data}
+
+@app.post("/content", dependencies=[Depends(require_api_key)])
+async def upsert_content(payload: ContentPayload):
+    """
+    Create or update a content asset. Automatically vectorizes using the
+    content name, type, venture, activation angle, and notes so it's
+    semantically searchable alongside contacts and follow-ups.
+    """
+    try:
+        content_id = payload.content_id or f"C-{int(time.time() * 1000)}"
+        data = payload.dict()
+        data["content_id"] = content_id
+        embedding_text = _build_content_text(payload)
+        vector = embed_profile(embedding_text)
+        await store_content(content_id, data, vector)
+        return {"success": True, "content_id": content_id}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.put("/content/{content_id}", dependencies=[Depends(require_api_key)])
+async def update_content(content_id: str, payload: ContentPayload):
+    """Update and re-vectorize a content asset."""
+    try:
+        data = payload.dict()
+        data["content_id"] = content_id
+        embedding_text = _build_content_text(payload)
+        vector = embed_profile(embedding_text)
+        await store_content(content_id, data, vector)
+        return {"success": True, "content_id": content_id}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.patch("/content/{content_id}/status", dependencies=[Depends(require_api_key)])
+async def update_content_status(content_id: str, payload: ContentStatusUpdate):
+    """Quick status or Prismm sync update without full re-vectorization."""
+    from db import _conn
+    import json as _json
+    conn = await _conn()
+    try:
+        row = await conn.fetchrow(
+            "SELECT data, embedding FROM content WHERE content_id = $1", content_id
+        )
+        if not row:
+            raise HTTPException(status_code=404, detail="Content not found")
+        data = _json.loads(row["data"])
+        data["status"] = payload.status
+        if payload.prismm_sync is not None:
+            data["prismm_sync"] = payload.prismm_sync
+        # Re-use existing embedding — status change doesn't affect semantic meaning
+        import numpy as np
+        existing_vector = list(row["embedding"]) if row["embedding"] else None
+        if existing_vector:
+            await store_content(content_id, data, existing_vector)
+        else:
+            await conn.execute(
+                "UPDATE content SET data = $1, updated_at = NOW() WHERE content_id = $2",
+                _json.dumps(data), content_id
+            )
+        return {"success": True}
+    finally:
+        await conn.close()
+
+@app.post("/content/search", dependencies=[Depends(require_api_key)])
+async def search_content(request: SearchRequest):
+    """
+    Semantic search across content assets.
+    Example queries: 'Prismm community bank article', 'email sequence for warm leads',
+    'climate tech thought leadership'
+    """
+    try:
+        vector = embed_profile(request.query)
+        results = await search_content_by_vector(vector, limit=request.top_k)
+        return {"query": request.query, "results": results}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.delete("/content/{content_id}", dependencies=[Depends(require_api_key)])
+async def remove_content(content_id: str):
+    await delete_content(content_id)
+    return {"success": True}
+
+# ════════════════════════════════════════════════════════════════════════════
+# FOLLOW-UPS
+# ════════════════════════════════════════════════════════════════════════════
+
+@app.get("/follow-ups/open", dependencies=[Depends(require_api_key)])
+async def list_open_follow_ups():
+    """All open follow-ups ordered by next_action_date. Used by Phoebe Monday scan."""
+    data = await get_open_follow_ups()
+    return {"success": True, "data": data, "count": len(data)}
+
+@app.get("/follow-ups/overdue", dependencies=[Depends(require_api_key)])
+async def list_overdue_follow_ups(as_of: Optional[str] = None):
+    """
+    Follow-ups where next_action_date has passed and status is still Open.
+    as_of = ISO date string e.g. 2026-04-01. Defaults to today.
+    """
+    from datetime import date
+    as_of_date = as_of or date.today().isoformat()
+    data = await get_overdue_follow_ups(as_of_date)
+    return {"success": True, "data": data, "count": len(data), "as_of": as_of_date}
+
+@app.get("/contact/{contact_id}/follow-ups", dependencies=[Depends(require_api_key)])
+async def list_follow_ups_for_contact(contact_id: str):
+    """All follow-ups tied to a specific contact — full history."""
+    data = await get_follow_ups_for_contact(contact_id)
+    return {"success": True, "data": data, "count": len(data)}
+
+@app.get("/follow-up/{follow_up_id}", dependencies=[Depends(require_api_key)])
+async def get_follow_up_by_id(follow_up_id: str):
+    data = await get_follow_up(follow_up_id)
+    if not data:
+        raise HTTPException(status_code=404, detail="Follow-up not found")
+    return {"success": True, "data": data}
+
+@app.post("/follow-up", dependencies=[Depends(require_api_key)])
+async def upsert_follow_up(payload: FollowUpPayload):
+    """
+    Create or update a follow-up. Automatically vectorized so you can search
+    semantically — e.g. 'who do I owe a follow-up about Prismm demo?'
+    Called by T018 (Post-Meeting Intelligence Engine) after every meeting.
+    """
+    try:
+        follow_up_id = payload.follow_up_id or f"FU-{int(time.time() * 1000)}"
+        data = payload.dict()
+        data["follow_up_id"] = follow_up_id
+        embedding_text = _build_follow_up_text(payload)
+        vector = embed_profile(embedding_text)
+        await store_follow_up(follow_up_id, payload.contact_id or "", data, vector)
+        return {"success": True, "follow_up_id": follow_up_id}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.put("/follow-up/{follow_up_id}", dependencies=[Depends(require_api_key)])
+async def update_follow_up(follow_up_id: str, payload: FollowUpPayload):
+    """Update and re-vectorize a follow-up."""
+    try:
+        data = payload.dict()
+        data["follow_up_id"] = follow_up_id
+        embedding_text = _build_follow_up_text(payload)
+        vector = embed_profile(embedding_text)
+        await store_follow_up(follow_up_id, payload.contact_id or "", data, vector)
+        return {"success": True, "follow_up_id": follow_up_id}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.patch("/follow-up/{follow_up_id}/status", dependencies=[Depends(require_api_key)])
+async def update_follow_up_status(follow_up_id: str, payload: FollowUpStatusUpdate):
+    """
+    Mark a follow-up Done, Overdue, or Cancelled without full re-vectorization.
+    When status → Done, this is the hook point for future relationship health scoring.
+    """
+    from db import _conn
+    import json as _json
+    conn = await _conn()
+    try:
+        row = await conn.fetchrow(
+            "SELECT data, contact_id, embedding FROM follow_ups WHERE follow_up_id = $1",
+            follow_up_id
+        )
+        if not row:
+            raise HTTPException(status_code=404, detail="Follow-up not found")
+        data = _json.loads(row["data"])
+        data["status"] = payload.status
+        if payload.completed_date:
+            data["completed_date"] = payload.completed_date
+        import numpy as np
+        existing_vector = list(row["embedding"]) if row["embedding"] else None
+        if existing_vector:
+            await store_follow_up(follow_up_id, row["contact_id"], data, existing_vector)
+        else:
+            await conn.execute(
+                "UPDATE follow_ups SET data = $1, updated_at = NOW() WHERE follow_up_id = $2",
+                _json.dumps(data), follow_up_id
+            )
+        return {"success": True, "follow_up_id": follow_up_id, "status": payload.status}
+    finally:
+        await conn.close()
+
+@app.post("/follow-ups/search", dependencies=[Depends(require_api_key)])
+async def search_follow_ups(request: SearchRequest):
+    """
+    Semantic search across follow-ups.
+    Example queries: 'follow-up about Prismm demo', 'intro I need to make for BTC',
+    'overdue check-in with advisor'
+    """
+    try:
+        vector = embed_profile(request.query)
+        results = await search_follow_ups_by_vector(vector, limit=request.top_k)
+        return {"query": request.query, "results": results}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.delete("/follow-up/{follow_up_id}", dependencies=[Depends(require_api_key)])
+async def remove_follow_up(follow_up_id: str):
+    await delete_follow_up(follow_up_id)
+    return {"success": True}
+
 # ── HELPERS ───────────────────────────────────────────────────────────────────
+
 def _build_profile_text(contact: ContactPayload) -> str:
     parts = [
         f"Name: {contact.full_name}",
@@ -432,5 +647,34 @@ def _build_profile_text(contact: ContactPayload) -> str:
         f"What they need: {contact.what_need}" if contact.what_need else "",
         f"What they offer: {contact.what_offer}" if contact.what_offer else "",
         f"Notes: {contact.notes}" if contact.notes else "",
+    ]
+    return " | ".join(p for p in parts if p)
+
+def _build_content_text(content: ContentPayload) -> str:
+    """
+    What gets embedded for a content asset.
+    Captures the semantic meaning of what this content IS and DOES.
+    """
+    parts = [
+        f"Content: {content.content_name}",
+        f"Type: {content.content_type}" if content.content_type else "",
+        f"Venture: {content.venture}" if content.venture else "",
+        f"Initiatives: {content.initiative_tags}" if content.initiative_tags else "",
+        f"Purpose: {content.activation_angle}" if content.activation_angle else "",
+        f"Notes: {content.notes}" if content.notes else "",
+    ]
+    return " | ".join(p for p in parts if p)
+
+def _build_follow_up_text(follow_up: FollowUpPayload) -> str:
+    """
+    What gets embedded for a follow-up.
+    Captures who it's with, what the action is, and which venture it belongs to.
+    """
+    parts = [
+        f"Follow-up with: {follow_up.contact_name}",
+        f"Meeting: {follow_up.meeting_name}" if follow_up.meeting_name else "",
+        f"Action needed: {follow_up.next_action}" if follow_up.next_action else "",
+        f"Venture: {follow_up.venture}" if follow_up.venture else "",
+        f"Notes: {follow_up.notes}" if follow_up.notes else "",
     ]
     return " | ".join(p for p in parts if p)
