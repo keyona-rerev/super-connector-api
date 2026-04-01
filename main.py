@@ -10,7 +10,7 @@ from db import (
     init_db,
     # contacts
     store_contact, get_contact, get_all_contacts, count_contacts, delete_contact,
-    find_similar, find_similar_by_vector,
+    find_similar, find_similar_by_vector, text_search_contacts,
     # initiatives
     upsert_initiative, get_initiative, get_all_initiatives, delete_initiative,
     # sub-projects
@@ -38,7 +38,7 @@ from db import (
     # brain dump
     brain_dump_insert,
 )
-from embedder import embed_profile
+from embedder import embed_profile, embed_query
 from matcher import find_matches, find_matches_by_vector
 from drafter import draft_intro
 from models import (
@@ -95,8 +95,8 @@ class ContactPayload(BaseModel):
     relationship_health: Optional[str] = ""
     activation_potential: Optional[str] = ""
     source: Optional[str] = ""
-    imported_via: Optional[str] = ""   # contact_id of colleague whose LinkedIn export this came from
-    active_advocacy: Optional[bool] = False  # true = in Active Advocacy Bucket
+    imported_via: Optional[str] = ""
+    active_advocacy: Optional[bool] = False
     notes: Optional[str] = ""
 
 class BulkPayload(BaseModel):
@@ -116,12 +116,12 @@ class BucketPayload(BaseModel):
     name: str
     description: Optional[str] = ""
     color: Optional[str] = ""
-    initiative_id: Optional[str] = ""   # links bucket to an initiative
+    initiative_id: Optional[str] = ""
 
 class BucketMemberPayload(BaseModel):
     contact_id: str
 
-# ── BRAIN DUMP MODEL ──────────────────────────────────────────────────────────
+# ── BRAIN DUMP MODELS ─────────────────────────────────────────────────────────
 class BrainDumpSubProject(BaseModel):
     sub_project_name: str
     description: Optional[str] = ""
@@ -172,23 +172,13 @@ def health():
     return {"status": "ok"}
 
 # ════════════════════════════════════════════════════════════════════════════
-# BRAIN DUMP  — single endpoint for all session pushes
+# BRAIN DUMP
 # ════════════════════════════════════════════════════════════════════════════
 
 @app.post("/brain-dump", dependencies=[Depends(require_api_key)])
 async def brain_dump(payload: BrainDumpPayload):
-    """
-    One-shot endpoint for brain dump sessions.
-    Accepts initiatives (with nested sub_projects), contacts, and action_items.
-    Handles ID generation and routing internally.
-    Returns a full results summary.
-    """
     ts = lambda: int(time.time() * 1000)
-
-    flat_initiatives = []
-    flat_sub_projects = []
-    flat_contacts = []
-    flat_action_items = []
+    flat_initiatives, flat_sub_projects, flat_contacts, flat_action_items = [], [], [], []
 
     for ini in (payload.initiatives or []):
         ini_id = f"INI-{ts()}"
@@ -196,10 +186,8 @@ async def brain_dump(payload: BrainDumpPayload):
         subs = ini_data.pop("sub_projects", []) or []
         ini_data["initiative_id"] = ini_id
         flat_initiatives.append(ini_data)
-
         for sub in subs:
-            sub_id = f"SUB-{ts()}"
-            sub["sub_project_id"] = sub_id
+            sub["sub_project_id"] = f"SUB-{ts()}"
             sub["initiative_id"] = ini_id
             flat_sub_projects.append(sub)
 
@@ -213,14 +201,8 @@ async def brain_dump(payload: BrainDumpPayload):
         a_data["action_id"] = f"ACT-{ts()}"
         flat_action_items.append(a_data)
 
-    results = await brain_dump_insert(
-        flat_initiatives,
-        flat_sub_projects,
-        flat_contacts,
-        flat_action_items,
-    )
+    results = await brain_dump_insert(flat_initiatives, flat_sub_projects, flat_contacts, flat_action_items)
 
-    # Vectorize any contacts that were pushed (best-effort, non-blocking)
     for c in flat_contacts:
         try:
             profile_text = " | ".join(filter(None, [
@@ -232,23 +214,12 @@ async def brain_dump(payload: BrainDumpPayload):
             vector = embed_profile(profile_text)
             await store_contact(c["contact_id"], c, vector)
         except Exception:
-            pass  # vectorization failure does not block the dump
+            pass
 
-    total_errors = (
-        len(results["initiatives"]["errors"]) +
-        len(results["sub_projects"]["errors"]) +
-        len(results["contacts"]["errors"]) +
-        len(results["action_items"]["errors"])
-    )
-
+    total_errors = sum(len(v["errors"]) for v in results.values())
     return {
         "success": total_errors == 0,
-        "summary": {
-            "initiatives": results["initiatives"]["ok"],
-            "sub_projects": results["sub_projects"]["ok"],
-            "contacts": results["contacts"]["ok"],
-            "action_items": results["action_items"]["ok"],
-        },
+        "summary": {k: v["ok"] for k, v in results.items()},
         "errors": results if total_errors > 0 else None,
     }
 
@@ -305,6 +276,18 @@ async def list_contacts(limit: int = 50, offset: int = 0):
     total = await count_contacts()
     return {"success": True, "data": contacts, "count": total}
 
+@app.get("/contacts/search", dependencies=[Depends(require_api_key)])
+async def text_search(q: str, limit: int = 50):
+    """
+    Simple text search — substring match on name, org, role, notes, venture, how_we_met, source.
+    This is the 'type a name and find them instantly' path. No embeddings, no AI, just ILIKE.
+    Name matches are ranked first.
+    """
+    if not q or not q.strip():
+        raise HTTPException(status_code=400, detail="Query parameter 'q' is required")
+    results = await text_search_contacts(q.strip(), limit=limit)
+    return {"success": True, "query": q, "data": results, "count": len(results)}
+
 @app.delete("/contact/{contact_id}", dependencies=[Depends(require_api_key)])
 async def remove_contact(contact_id: str):
     await delete_contact(contact_id)
@@ -319,8 +302,13 @@ async def match_contact(contact_id: str, limit: int = 5):
 
 @app.post("/search", dependencies=[Depends(require_api_key)])
 async def search_contacts(request: SearchRequest):
+    """
+    Semantic search — use embed_query (not embed_profile) for correct Voyage AI query mode.
+    Use this for descriptive queries like 'climate tech founder in NYC'.
+    For name/text lookups use GET /contacts/search?q= instead.
+    """
     try:
-        vector = embed_profile(request.query)
+        vector = embed_query(request.query)   # FIXED: was embed_profile, now embed_query
         results = await find_matches_by_vector(vector, limit=request.top_k)
         return {"query": request.query, "results": results}
     except Exception as e:
@@ -363,7 +351,6 @@ async def get_contact_bucket_membership(contact_id: str):
 
 @app.get("/initiative/{initiative_id}/buckets", dependencies=[Depends(require_api_key)])
 async def list_buckets_for_initiative(initiative_id: str):
-    """All buckets linked to an initiative — surfaces contact pools on the initiative view."""
     data = await get_buckets_for_initiative(initiative_id)
     return {"success": True, "data": data, "count": len(data)}
 
@@ -704,7 +691,7 @@ async def update_content_status(content_id: str, payload: ContentStatusUpdate):
 @app.post("/content/search", dependencies=[Depends(require_api_key)])
 async def search_content(request: SearchRequest):
     try:
-        vector = embed_profile(request.query)
+        vector = embed_query(request.query)
         results = await search_content_by_vector(vector, limit=request.top_k)
         return {"query": request.query, "results": results}
     except Exception as e:
@@ -800,7 +787,7 @@ async def update_follow_up_status(follow_up_id: str, payload: FollowUpStatusUpda
 @app.post("/follow-ups/search", dependencies=[Depends(require_api_key)])
 async def search_follow_ups(request: SearchRequest):
     try:
-        vector = embed_profile(request.query)
+        vector = embed_query(request.query)
         results = await search_follow_ups_by_vector(vector, limit=request.top_k)
         return {"query": request.query, "results": results}
     except Exception as e:
@@ -829,9 +816,7 @@ async def get_event_by_id(event_id: str):
     confirmed = sum(1 for g in guests if g.get("guest_status") == "Confirmed")
     attended = sum(1 for g in guests if g.get("guest_status") == "Attended")
     return {
-        "success": True,
-        "data": data,
-        "guests": guests,
+        "success": True, "data": data, "guests": guests,
         "guest_summary": {"total": len(guests), "confirmed": confirmed, "attended": attended},
     }
 
@@ -887,18 +872,14 @@ async def update_event_guest(guest_id: str, payload: EventGuestUpdate):
     conn = await _conn()
     try:
         row = await conn.fetchrow(
-            "SELECT event_id, contact_id, data FROM event_guests WHERE guest_id = $1",
-            guest_id
+            "SELECT event_id, contact_id, data FROM event_guests WHERE guest_id = $1", guest_id
         )
         if not row:
             raise HTTPException(status_code=404, detail="Event guest not found")
         data = _json.loads(row["data"])
-        if payload.role is not None:
-            data["role"] = payload.role
-        if payload.guest_status is not None:
-            data["guest_status"] = payload.guest_status
-        if payload.notes is not None:
-            data["notes"] = payload.notes
+        if payload.role is not None: data["role"] = payload.role
+        if payload.guest_status is not None: data["guest_status"] = payload.guest_status
+        if payload.notes is not None: data["notes"] = payload.notes
         await upsert_event_guest(guest_id, row["event_id"], row["contact_id"], data)
         return {"success": True}
     finally:
