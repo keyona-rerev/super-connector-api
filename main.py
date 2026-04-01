@@ -3,7 +3,7 @@ from fastapi import FastAPI, HTTPException, Security, Depends
 from fastapi.security.api_key import APIKeyHeader
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, List, Any, Dict
 import os
 
 from db import (
@@ -34,7 +34,9 @@ from db import (
     # buckets
     upsert_bucket, get_all_buckets, get_bucket, delete_bucket,
     add_contact_to_bucket, remove_contact_from_bucket,
-    get_buckets_for_contact, get_contacts_in_bucket,
+    get_buckets_for_contact, get_contacts_in_bucket, get_buckets_for_initiative,
+    # brain dump
+    brain_dump_insert,
 )
 from embedder import embed_profile
 from matcher import find_matches, find_matches_by_vector
@@ -93,6 +95,8 @@ class ContactPayload(BaseModel):
     relationship_health: Optional[str] = ""
     activation_potential: Optional[str] = ""
     source: Optional[str] = ""
+    imported_via: Optional[str] = ""   # contact_id of colleague whose LinkedIn export this came from
+    active_advocacy: Optional[bool] = False  # true = in Active Advocacy Bucket
     notes: Optional[str] = ""
 
 class BulkPayload(BaseModel):
@@ -111,15 +115,142 @@ class BucketPayload(BaseModel):
     bucket_id: Optional[str] = None
     name: str
     description: Optional[str] = ""
-    color: Optional[str] = ""   # hex or named colour, purely cosmetic
+    color: Optional[str] = ""
+    initiative_id: Optional[str] = ""   # links bucket to an initiative
 
 class BucketMemberPayload(BaseModel):
     contact_id: str
+
+# ── BRAIN DUMP MODEL ──────────────────────────────────────────────────────────
+class BrainDumpSubProject(BaseModel):
+    sub_project_name: str
+    description: Optional[str] = ""
+    status: Optional[str] = "Not Started"
+    priority: Optional[str] = "Medium"
+    notes: Optional[str] = ""
+
+class BrainDumpInitiative(BaseModel):
+    initiative_name: str
+    venture: Optional[str] = ""
+    goal: Optional[str] = ""
+    status: Optional[str] = "Brain Dump"
+    priority: Optional[str] = "Medium"
+    notes: Optional[str] = ""
+    phoebe_cadence: Optional[str] = "Weekly"
+    brain_dump: Optional[str] = ""
+    sub_projects: Optional[List[BrainDumpSubProject]] = []
+
+class BrainDumpContact(BaseModel):
+    full_name: str
+    title_role: Optional[str] = ""
+    organization: Optional[str] = ""
+    how_we_met: Optional[str] = ""
+    venture: Optional[str] = ""
+    relationship_health: Optional[str] = "Lukewarm"
+    activation_potential: Optional[str] = "Medium"
+    imported_via: Optional[str] = ""
+    active_advocacy: Optional[bool] = False
+    notes: Optional[str] = ""
+
+class BrainDumpActionItem(BaseModel):
+    description: str
+    initiative_id: Optional[str] = "SPRINT"
+    action_type: Optional[str] = "Research"
+    priority: Optional[str] = "Medium"
+    due_date: Optional[str] = None
+    status: Optional[str] = "Open"
+    source: Optional[str] = "Brain Dump"
+
+class BrainDumpPayload(BaseModel):
+    initiatives: Optional[List[BrainDumpInitiative]] = []
+    contacts: Optional[List[BrainDumpContact]] = []
+    action_items: Optional[List[BrainDumpActionItem]] = []
 
 # ── OPEN ENDPOINTS ────────────────────────────────────────────────────────────
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+# ════════════════════════════════════════════════════════════════════════════
+# BRAIN DUMP  — single endpoint for all session pushes
+# ════════════════════════════════════════════════════════════════════════════
+
+@app.post("/brain-dump", dependencies=[Depends(require_api_key)])
+async def brain_dump(payload: BrainDumpPayload):
+    """
+    One-shot endpoint for brain dump sessions.
+    Accepts initiatives (with nested sub_projects), contacts, and action_items.
+    Handles ID generation and routing internally.
+    Returns a full results summary.
+    """
+    ts = lambda: int(time.time() * 1000)
+
+    flat_initiatives = []
+    flat_sub_projects = []
+    flat_contacts = []
+    flat_action_items = []
+
+    for ini in (payload.initiatives or []):
+        ini_id = f"INI-{ts()}"
+        ini_data = ini.dict()
+        subs = ini_data.pop("sub_projects", []) or []
+        ini_data["initiative_id"] = ini_id
+        flat_initiatives.append(ini_data)
+
+        for sub in subs:
+            sub_id = f"SUB-{ts()}"
+            sub["sub_project_id"] = sub_id
+            sub["initiative_id"] = ini_id
+            flat_sub_projects.append(sub)
+
+    for contact in (payload.contacts or []):
+        c_data = contact.dict()
+        c_data["contact_id"] = f"C{ts()}"
+        flat_contacts.append(c_data)
+
+    for item in (payload.action_items or []):
+        a_data = item.dict()
+        a_data["action_id"] = f"ACT-{ts()}"
+        flat_action_items.append(a_data)
+
+    results = await brain_dump_insert(
+        flat_initiatives,
+        flat_sub_projects,
+        flat_contacts,
+        flat_action_items,
+    )
+
+    # Vectorize any contacts that were pushed (best-effort, non-blocking)
+    for c in flat_contacts:
+        try:
+            profile_text = " | ".join(filter(None, [
+                f"Name: {c.get('full_name','')}",
+                f"Role: {c.get('title_role','')}",
+                f"Org: {c.get('organization','')}",
+                f"Notes: {c.get('notes','')}",
+            ]))
+            vector = embed_profile(profile_text)
+            await store_contact(c["contact_id"], c, vector)
+        except Exception:
+            pass  # vectorization failure does not block the dump
+
+    total_errors = (
+        len(results["initiatives"]["errors"]) +
+        len(results["sub_projects"]["errors"]) +
+        len(results["contacts"]["errors"]) +
+        len(results["action_items"]["errors"])
+    )
+
+    return {
+        "success": total_errors == 0,
+        "summary": {
+            "initiatives": results["initiatives"]["ok"],
+            "sub_projects": results["sub_projects"]["ok"],
+            "contacts": results["contacts"]["ok"],
+            "action_items": results["action_items"]["ok"],
+        },
+        "errors": results if total_errors > 0 else None,
+    }
 
 # ════════════════════════════════════════════════════════════════════════════
 # CONTACTS
@@ -210,7 +341,6 @@ async def draft_intro_email(payload: DraftPayload):
 
 @app.get("/buckets", dependencies=[Depends(require_api_key)])
 async def list_buckets():
-    """All buckets with member counts and contact_id lists."""
     data = await get_all_buckets()
     return {"success": True, "data": data, "count": len(data)}
 
@@ -223,15 +353,19 @@ async def get_bucket_by_id(bucket_id: str):
 
 @app.get("/bucket/{bucket_id}/contacts", dependencies=[Depends(require_api_key)])
 async def list_contacts_in_bucket(bucket_id: str):
-    """Full contact profiles for everyone in a bucket."""
     contacts = await get_contacts_in_bucket(bucket_id)
     return {"success": True, "data": contacts, "count": len(contacts)}
 
 @app.get("/contact/{contact_id}/buckets", dependencies=[Depends(require_api_key)])
 async def get_contact_bucket_membership(contact_id: str):
-    """All buckets a contact belongs to."""
     data = await get_buckets_for_contact(contact_id)
     return {"success": True, "data": data}
+
+@app.get("/initiative/{initiative_id}/buckets", dependencies=[Depends(require_api_key)])
+async def list_buckets_for_initiative(initiative_id: str):
+    """All buckets linked to an initiative — surfaces contact pools on the initiative view."""
+    data = await get_buckets_for_initiative(initiative_id)
+    return {"success": True, "data": data, "count": len(data)}
 
 @app.post("/bucket", dependencies=[Depends(require_api_key)])
 async def create_bucket(payload: BucketPayload):
@@ -286,12 +420,14 @@ async def get_initiative_by_id(initiative_id: str):
     sub_projects = await get_sub_projects_for_initiative(initiative_id)
     stakeholders = await get_stakeholders_for_initiative(initiative_id)
     action_items = await get_action_items_for_initiative(initiative_id)
+    buckets = await get_buckets_for_initiative(initiative_id)
     return {
         "success": True,
         "data": data,
         "sub_projects": sub_projects,
         "stakeholders": stakeholders,
         "action_items": action_items,
+        "buckets": buckets,
     }
 
 @app.post("/initiative", dependencies=[Depends(require_api_key)])
@@ -366,7 +502,6 @@ async def list_stakeholders(initiative_id: str):
 
 @app.get("/contact/{contact_id}/initiatives", dependencies=[Depends(require_api_key)])
 async def get_contact_initiatives(contact_id: str):
-    """Cross-initiative surfacing — all initiatives a contact touches."""
     data = await get_stakeholders_for_contact(contact_id)
     return {"success": True, "data": data, "count": len(data)}
 
@@ -452,24 +587,14 @@ async def create_action_item(payload: ActionItemPayload):
     action_id = payload.action_id or f"ACT-{int(time.time() * 1000)}"
     data = payload.dict()
     data["action_id"] = action_id
-    await upsert_action_item(
-        action_id,
-        payload.initiative_id or "SPRINT",
-        payload.stakeholder_id or "",
-        data
-    )
+    await upsert_action_item(action_id, payload.initiative_id or "SPRINT", payload.stakeholder_id or "", data)
     return {"success": True, "action_id": action_id}
 
 @app.put("/action-item/{action_id}", dependencies=[Depends(require_api_key)])
 async def update_action_item(action_id: str, payload: ActionItemPayload):
     data = payload.dict()
     data["action_id"] = action_id
-    await upsert_action_item(
-        action_id,
-        payload.initiative_id or "SPRINT",
-        payload.stakeholder_id or "",
-        data
-    )
+    await upsert_action_item(action_id, payload.initiative_id or "SPRINT", payload.stakeholder_id or "", data)
     return {"success": True}
 
 @app.patch("/action-item/{action_id}/status", dependencies=[Depends(require_api_key)])
