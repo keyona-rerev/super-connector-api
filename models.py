@@ -146,3 +146,40 @@ class FollowUpPayload(BaseModel):
 class FollowUpStatusUpdate(BaseModel):
     status: str
     completed_date: Optional[str] = None
+
+
+# ── EVENTS ────────────────────────────────────────────────────────────────────
+
+class EventPayload(BaseModel):
+    event_id: Optional[str] = None            # auto-generated if omitted: EVT-{timestamp}
+    event_name: str
+    event_type: Optional[str] = ""            # Hosting / Attending / Workshop
+    venture: Optional[str] = ""               # ReRev Labs / Prismm / BTC / Sekhmetic / etc.
+    date: Optional[str] = None                # ISO date string
+    location: Optional[str] = ""
+    status: Optional[str] = "Planning"        # Planning / Confirmed / Complete / Cancelled
+    initiative_id: Optional[str] = ""         # FK to initiatives — nullable
+    description: Optional[str] = ""
+    notes: Optional[str] = ""
+
+
+class EventStatusUpdate(BaseModel):
+    status: str
+
+
+# ── EVENT GUESTS ──────────────────────────────────────────────────────────────
+
+class EventGuestPayload(BaseModel):
+    guest_id: Optional[str] = None            # auto-generated if omitted: EG-{timestamp}
+    event_id: str                             # FK to events — required
+    contact_id: Optional[str] = ""            # FK to contacts — nullable (can add before contact exists)
+    full_name: str
+    role: Optional[str] = ""                  # Speaker / Panelist / Attendee / Interviewee / Organizer / Sponsor
+    guest_status: Optional[str] = "Invited"   # Invited / Confirmed / Attended / No-show / Declined
+    notes: Optional[str] = ""
+
+
+class EventGuestUpdate(BaseModel):
+    role: Optional[str] = None
+    guest_status: Optional[str] = None
+    notes: Optional[str] = None
