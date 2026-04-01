@@ -9,7 +9,7 @@ import os
 from db import (
     init_db,
     # contacts
-    store_contact, get_contact, get_all_contacts, delete_contact,
+    store_contact, get_contact, get_all_contacts, count_contacts, delete_contact,
     find_similar, find_similar_by_vector,
     # initiatives
     upsert_initiative, get_initiative, get_all_initiatives, delete_initiative,
@@ -31,6 +31,10 @@ from db import (
     # events
     upsert_event, get_event, get_all_events, delete_event,
     upsert_event_guest, get_guests_for_event, delete_event_guest,
+    # buckets
+    upsert_bucket, get_all_buckets, get_bucket, delete_bucket,
+    add_contact_to_bucket, remove_contact_from_bucket,
+    get_buckets_for_contact, get_contacts_in_bucket,
 )
 from embedder import embed_profile
 from matcher import find_matches, find_matches_by_vector
@@ -102,6 +106,16 @@ class SearchRequest(BaseModel):
     query: str
     top_k: Optional[int] = 10
 
+# ── BUCKET MODELS ─────────────────────────────────────────────────────────────
+class BucketPayload(BaseModel):
+    bucket_id: Optional[str] = None
+    name: str
+    description: Optional[str] = ""
+    color: Optional[str] = ""   # hex or named colour, purely cosmetic
+
+class BucketMemberPayload(BaseModel):
+    contact_id: str
+
 # ── OPEN ENDPOINTS ────────────────────────────────────────────────────────────
 @app.get("/health")
 def health():
@@ -141,7 +155,8 @@ async def get_contact_by_id(contact_id: str):
     if not contact:
         raise HTTPException(status_code=404, detail="Contact not found")
     stakeholder_links = await get_stakeholders_for_contact(contact_id)
-    return {"success": True, "data": contact, "initiative_links": stakeholder_links}
+    buckets = await get_buckets_for_contact(contact_id)
+    return {"success": True, "data": contact, "initiative_links": stakeholder_links, "buckets": buckets}
 
 @app.put("/contact/{contact_id}", dependencies=[Depends(require_api_key)])
 async def update_contact(contact_id: str, payload: ContactPayload):
@@ -156,7 +171,8 @@ async def update_contact(contact_id: str, payload: ContactPayload):
 @app.get("/contacts", dependencies=[Depends(require_api_key)])
 async def list_contacts(limit: int = 50, offset: int = 0):
     contacts = await get_all_contacts(limit=limit, offset=offset)
-    return {"success": True, "data": contacts, "count": len(contacts)}
+    total = await count_contacts()
+    return {"success": True, "data": contacts, "count": total}
 
 @app.delete("/contact/{contact_id}", dependencies=[Depends(require_api_key)])
 async def remove_contact(contact_id: str):
@@ -187,6 +203,71 @@ async def draft_intro_email(payload: DraftPayload):
         raise HTTPException(status_code=404, detail="One or both contacts not found")
     result = draft_intro(contact_a, contact_b)
     return {"success": True, "draft": result}
+
+# ════════════════════════════════════════════════════════════════════════════
+# BUCKETS
+# ════════════════════════════════════════════════════════════════════════════
+
+@app.get("/buckets", dependencies=[Depends(require_api_key)])
+async def list_buckets():
+    """All buckets with member counts and contact_id lists."""
+    data = await get_all_buckets()
+    return {"success": True, "data": data, "count": len(data)}
+
+@app.get("/bucket/{bucket_id}", dependencies=[Depends(require_api_key)])
+async def get_bucket_by_id(bucket_id: str):
+    data = await get_bucket(bucket_id)
+    if not data:
+        raise HTTPException(status_code=404, detail="Bucket not found")
+    return {"success": True, "data": data}
+
+@app.get("/bucket/{bucket_id}/contacts", dependencies=[Depends(require_api_key)])
+async def list_contacts_in_bucket(bucket_id: str):
+    """Full contact profiles for everyone in a bucket."""
+    contacts = await get_contacts_in_bucket(bucket_id)
+    return {"success": True, "data": contacts, "count": len(contacts)}
+
+@app.get("/contact/{contact_id}/buckets", dependencies=[Depends(require_api_key)])
+async def get_contact_bucket_membership(contact_id: str):
+    """All buckets a contact belongs to."""
+    data = await get_buckets_for_contact(contact_id)
+    return {"success": True, "data": data}
+
+@app.post("/bucket", dependencies=[Depends(require_api_key)])
+async def create_bucket(payload: BucketPayload):
+    bucket_id = payload.bucket_id or f"BKT-{int(time.time() * 1000)}"
+    data = payload.dict()
+    data["bucket_id"] = bucket_id
+    await upsert_bucket(bucket_id, data)
+    return {"success": True, "bucket_id": bucket_id}
+
+@app.put("/bucket/{bucket_id}", dependencies=[Depends(require_api_key)])
+async def update_bucket(bucket_id: str, payload: BucketPayload):
+    existing = await get_bucket(bucket_id)
+    if not existing:
+        raise HTTPException(status_code=404, detail="Bucket not found")
+    data = {k: v for k, v in payload.dict().items() if v is not None}
+    data["bucket_id"] = bucket_id
+    await upsert_bucket(bucket_id, data)
+    return {"success": True}
+
+@app.post("/bucket/{bucket_id}/members", dependencies=[Depends(require_api_key)])
+async def add_member_to_bucket(bucket_id: str, payload: BucketMemberPayload):
+    bucket = await get_bucket(bucket_id)
+    if not bucket:
+        raise HTTPException(status_code=404, detail="Bucket not found")
+    await add_contact_to_bucket(bucket_id, payload.contact_id)
+    return {"success": True, "bucket_id": bucket_id, "contact_id": payload.contact_id}
+
+@app.delete("/bucket/{bucket_id}/members/{contact_id}", dependencies=[Depends(require_api_key)])
+async def remove_member_from_bucket(bucket_id: str, contact_id: str):
+    await remove_contact_from_bucket(bucket_id, contact_id)
+    return {"success": True}
+
+@app.delete("/bucket/{bucket_id}", dependencies=[Depends(require_api_key)])
+async def remove_bucket(bucket_id: str):
+    await delete_bucket(bucket_id)
+    return {"success": True}
 
 # ════════════════════════════════════════════════════════════════════════════
 # INITIATIVES
@@ -432,7 +513,6 @@ async def remove_action_item(action_id: str):
 
 @app.get("/content", dependencies=[Depends(require_api_key)])
 async def list_content():
-    """List all content assets."""
     data = await get_all_content()
     return {"success": True, "data": data, "count": len(data)}
 
@@ -458,7 +538,6 @@ async def upsert_content(payload: ContentPayload):
 
 @app.put("/content/{content_id}", dependencies=[Depends(require_api_key)])
 async def update_content(content_id: str, payload: ContentPayload):
-    """Update and re-vectorize a content asset."""
     try:
         data = payload.dict()
         data["content_id"] = content_id
@@ -471,7 +550,6 @@ async def update_content(content_id: str, payload: ContentPayload):
 
 @app.patch("/content/{content_id}/status", dependencies=[Depends(require_api_key)])
 async def update_content_status(content_id: str, payload: ContentStatusUpdate):
-    """Quick status or Prismm sync update without full re-vectorization."""
     from db import _conn
     import json as _json
     conn = await _conn()
@@ -518,7 +596,6 @@ async def remove_content(content_id: str):
 
 @app.get("/follow-ups/open", dependencies=[Depends(require_api_key)])
 async def list_open_follow_ups():
-    """All open follow-ups ordered by next_action_date. Used by Phoebe Monday scan."""
     data = await get_open_follow_ups()
     return {"success": True, "data": data, "count": len(data)}
 
@@ -531,7 +608,6 @@ async def list_overdue_follow_ups(as_of: Optional[str] = None):
 
 @app.get("/contact/{contact_id}/follow-ups", dependencies=[Depends(require_api_key)])
 async def list_follow_ups_for_contact(contact_id: str):
-    """All follow-ups tied to a specific contact — full history."""
     data = await get_follow_ups_for_contact(contact_id)
     return {"success": True, "data": data, "count": len(data)}
 
@@ -616,17 +692,11 @@ async def remove_follow_up(follow_up_id: str):
 
 @app.get("/events", dependencies=[Depends(require_api_key)])
 async def list_events(type: Optional[str] = None, venture: Optional[str] = None):
-    """
-    List all events. Optional filters:
-      ?type=Hosting   — Hosting / Attending / Workshop
-      ?venture=BTC    — any venture name
-    """
     data = await get_all_events(event_type=type, venture=venture)
     return {"success": True, "data": data, "count": len(data)}
 
 @app.get("/event/{event_id}", dependencies=[Depends(require_api_key)])
 async def get_event_by_id(event_id: str):
-    """Fetch event + full guest list."""
     data = await get_event(event_id)
     if not data:
         raise HTTPException(status_code=404, detail="Event not found")
@@ -637,11 +707,7 @@ async def get_event_by_id(event_id: str):
         "success": True,
         "data": data,
         "guests": guests,
-        "guest_summary": {
-            "total": len(guests),
-            "confirmed": confirmed,
-            "attended": attended,
-        },
+        "guest_summary": {"total": len(guests), "confirmed": confirmed, "attended": attended},
     }
 
 @app.post("/event", dependencies=[Depends(require_api_key)])
@@ -691,7 +757,6 @@ async def add_event_guest(payload: EventGuestPayload):
 
 @app.patch("/event-guest/{guest_id}", dependencies=[Depends(require_api_key)])
 async def update_event_guest(guest_id: str, payload: EventGuestUpdate):
-    """Update guest role, status, or notes. Omitted fields are preserved."""
     from db import _conn
     import json as _json
     conn = await _conn()
