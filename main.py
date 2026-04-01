@@ -88,6 +88,7 @@ class ContactPayload(BaseModel):
     what_offer: Optional[str] = ""
     relationship_health: Optional[str] = ""
     activation_potential: Optional[str] = ""
+    source: Optional[str] = ""
     notes: Optional[str] = ""
 
 class BulkPayload(BaseModel):
@@ -730,6 +731,7 @@ def _build_profile_text(contact: ContactPayload) -> str:
         f"What they're building: {contact.what_building}" if contact.what_building else "",
         f"What they need: {contact.what_need}" if contact.what_need else "",
         f"What they offer: {contact.what_offer}" if contact.what_offer else "",
+        f"Met at: {contact.source}" if contact.source else "",
         f"Notes: {contact.notes}" if contact.notes else "",
     ]
     return " | ".join(p for p in parts if p)
