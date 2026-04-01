@@ -28,6 +28,9 @@ from db import (
     # follow-ups
     store_follow_up, get_follow_up, get_open_follow_ups, get_overdue_follow_ups,
     get_follow_ups_for_contact, search_follow_ups_by_vector, delete_follow_up,
+    # events
+    upsert_event, get_event, get_all_events, delete_event,
+    upsert_event_guest, get_guests_for_event, delete_event_guest,
 )
 from embedder import embed_profile
 from matcher import find_matches, find_matches_by_vector
@@ -40,6 +43,8 @@ from models import (
     ActionItemPayload, ActionItemStatusUpdate,
     ContentPayload, ContentStatusUpdate,
     FollowUpPayload, FollowUpStatusUpdate,
+    EventPayload, EventStatusUpdate,
+    EventGuestPayload, EventGuestUpdate,
 )
 
 app = FastAPI(title="Super Connector API")
@@ -439,11 +444,6 @@ async def get_content_by_id(content_id: str):
 
 @app.post("/content", dependencies=[Depends(require_api_key)])
 async def upsert_content(payload: ContentPayload):
-    """
-    Create or update a content asset. Automatically vectorizes using the
-    content name, type, venture, activation angle, and notes so it's
-    semantically searchable alongside contacts and follow-ups.
-    """
     try:
         content_id = payload.content_id or f"C-{int(time.time() * 1000)}"
         data = payload.dict()
@@ -484,7 +484,6 @@ async def update_content_status(content_id: str, payload: ContentStatusUpdate):
         data["status"] = payload.status
         if payload.prismm_sync is not None:
             data["prismm_sync"] = payload.prismm_sync
-        # Re-use existing embedding — status change doesn't affect semantic meaning
         import numpy as np
         existing_vector = list(row["embedding"]) if row["embedding"] else None
         if existing_vector:
@@ -500,11 +499,6 @@ async def update_content_status(content_id: str, payload: ContentStatusUpdate):
 
 @app.post("/content/search", dependencies=[Depends(require_api_key)])
 async def search_content(request: SearchRequest):
-    """
-    Semantic search across content assets.
-    Example queries: 'Prismm community bank article', 'email sequence for warm leads',
-    'climate tech thought leadership'
-    """
     try:
         vector = embed_profile(request.query)
         results = await search_content_by_vector(vector, limit=request.top_k)
@@ -529,10 +523,6 @@ async def list_open_follow_ups():
 
 @app.get("/follow-ups/overdue", dependencies=[Depends(require_api_key)])
 async def list_overdue_follow_ups(as_of: Optional[str] = None):
-    """
-    Follow-ups where next_action_date has passed and status is still Open.
-    as_of = ISO date string e.g. 2026-04-01. Defaults to today.
-    """
     from datetime import date
     as_of_date = as_of or date.today().isoformat()
     data = await get_overdue_follow_ups(as_of_date)
@@ -553,11 +543,6 @@ async def get_follow_up_by_id(follow_up_id: str):
 
 @app.post("/follow-up", dependencies=[Depends(require_api_key)])
 async def upsert_follow_up(payload: FollowUpPayload):
-    """
-    Create or update a follow-up. Automatically vectorized so you can search
-    semantically — e.g. 'who do I owe a follow-up about Prismm demo?'
-    Called by T018 (Post-Meeting Intelligence Engine) after every meeting.
-    """
     try:
         follow_up_id = payload.follow_up_id or f"FU-{int(time.time() * 1000)}"
         data = payload.dict()
@@ -571,7 +556,6 @@ async def upsert_follow_up(payload: FollowUpPayload):
 
 @app.put("/follow-up/{follow_up_id}", dependencies=[Depends(require_api_key)])
 async def update_follow_up(follow_up_id: str, payload: FollowUpPayload):
-    """Update and re-vectorize a follow-up."""
     try:
         data = payload.dict()
         data["follow_up_id"] = follow_up_id
@@ -584,10 +568,6 @@ async def update_follow_up(follow_up_id: str, payload: FollowUpPayload):
 
 @app.patch("/follow-up/{follow_up_id}/status", dependencies=[Depends(require_api_key)])
 async def update_follow_up_status(follow_up_id: str, payload: FollowUpStatusUpdate):
-    """
-    Mark a follow-up Done, Overdue, or Cancelled without full re-vectorization.
-    When status → Done, this is the hook point for future relationship health scoring.
-    """
     from db import _conn
     import json as _json
     conn = await _conn()
@@ -617,11 +597,6 @@ async def update_follow_up_status(follow_up_id: str, payload: FollowUpStatusUpda
 
 @app.post("/follow-ups/search", dependencies=[Depends(require_api_key)])
 async def search_follow_ups(request: SearchRequest):
-    """
-    Semantic search across follow-ups.
-    Example queries: 'follow-up about Prismm demo', 'intro I need to make for BTC',
-    'overdue check-in with advisor'
-    """
     try:
         vector = embed_profile(request.query)
         results = await search_follow_ups_by_vector(vector, limit=request.top_k)
@@ -632,6 +607,115 @@ async def search_follow_ups(request: SearchRequest):
 @app.delete("/follow-up/{follow_up_id}", dependencies=[Depends(require_api_key)])
 async def remove_follow_up(follow_up_id: str):
     await delete_follow_up(follow_up_id)
+    return {"success": True}
+
+# ════════════════════════════════════════════════════════════════════════════
+# EVENTS
+# ════════════════════════════════════════════════════════════════════════════
+
+@app.get("/events", dependencies=[Depends(require_api_key)])
+async def list_events(type: Optional[str] = None, venture: Optional[str] = None):
+    """
+    List all events. Optional filters:
+      ?type=Hosting   — Hosting / Attending / Workshop
+      ?venture=BTC    — any venture name
+    """
+    data = await get_all_events(event_type=type, venture=venture)
+    return {"success": True, "data": data, "count": len(data)}
+
+@app.get("/event/{event_id}", dependencies=[Depends(require_api_key)])
+async def get_event_by_id(event_id: str):
+    """Fetch event + full guest list."""
+    data = await get_event(event_id)
+    if not data:
+        raise HTTPException(status_code=404, detail="Event not found")
+    guests = await get_guests_for_event(event_id)
+    confirmed = sum(1 for g in guests if g.get("guest_status") == "Confirmed")
+    attended = sum(1 for g in guests if g.get("guest_status") == "Attended")
+    return {
+        "success": True,
+        "data": data,
+        "guests": guests,
+        "guest_summary": {
+            "total": len(guests),
+            "confirmed": confirmed,
+            "attended": attended,
+        },
+    }
+
+@app.post("/event", dependencies=[Depends(require_api_key)])
+async def create_event(payload: EventPayload):
+    event_id = payload.event_id or f"EVT-{int(time.time() * 1000)}"
+    data = payload.dict()
+    data["event_id"] = event_id
+    await upsert_event(event_id, data)
+    return {"success": True, "event_id": event_id}
+
+@app.put("/event/{event_id}", dependencies=[Depends(require_api_key)])
+async def update_event(event_id: str, payload: EventPayload):
+    existing = await get_event(event_id)
+    if not existing:
+        raise HTTPException(status_code=404, detail="Event not found")
+    data = {**existing, **{k: v for k, v in payload.dict().items() if v is not None}}
+    data["event_id"] = event_id
+    await upsert_event(event_id, data)
+    return {"success": True}
+
+@app.patch("/event/{event_id}/status", dependencies=[Depends(require_api_key)])
+async def update_event_status(event_id: str, payload: EventStatusUpdate):
+    existing = await get_event(event_id)
+    if not existing:
+        raise HTTPException(status_code=404, detail="Event not found")
+    existing["status"] = payload.status
+    await upsert_event(event_id, existing)
+    return {"success": True, "event_id": event_id, "status": payload.status}
+
+@app.delete("/event/{event_id}", dependencies=[Depends(require_api_key)])
+async def remove_event(event_id: str):
+    await delete_event(event_id)
+    return {"success": True}
+
+@app.get("/event/{event_id}/guests", dependencies=[Depends(require_api_key)])
+async def list_event_guests(event_id: str):
+    guests = await get_guests_for_event(event_id)
+    return {"success": True, "data": guests, "count": len(guests)}
+
+@app.post("/event-guest", dependencies=[Depends(require_api_key)])
+async def add_event_guest(payload: EventGuestPayload):
+    guest_id = payload.guest_id or f"EG-{int(time.time() * 1000)}"
+    data = payload.dict()
+    data["guest_id"] = guest_id
+    await upsert_event_guest(guest_id, payload.event_id, payload.contact_id or "", data)
+    return {"success": True, "guest_id": guest_id}
+
+@app.patch("/event-guest/{guest_id}", dependencies=[Depends(require_api_key)])
+async def update_event_guest(guest_id: str, payload: EventGuestUpdate):
+    """Update guest role, status, or notes. Omitted fields are preserved."""
+    from db import _conn
+    import json as _json
+    conn = await _conn()
+    try:
+        row = await conn.fetchrow(
+            "SELECT event_id, contact_id, data FROM event_guests WHERE guest_id = $1",
+            guest_id
+        )
+        if not row:
+            raise HTTPException(status_code=404, detail="Event guest not found")
+        data = _json.loads(row["data"])
+        if payload.role is not None:
+            data["role"] = payload.role
+        if payload.guest_status is not None:
+            data["guest_status"] = payload.guest_status
+        if payload.notes is not None:
+            data["notes"] = payload.notes
+        await upsert_event_guest(guest_id, row["event_id"], row["contact_id"], data)
+        return {"success": True}
+    finally:
+        await conn.close()
+
+@app.delete("/event-guest/{guest_id}", dependencies=[Depends(require_api_key)])
+async def remove_event_guest(guest_id: str):
+    await delete_event_guest(guest_id)
     return {"success": True}
 
 # ── HELPERS ───────────────────────────────────────────────────────────────────
@@ -651,10 +735,6 @@ def _build_profile_text(contact: ContactPayload) -> str:
     return " | ".join(p for p in parts if p)
 
 def _build_content_text(content: ContentPayload) -> str:
-    """
-    What gets embedded for a content asset.
-    Captures the semantic meaning of what this content IS and DOES.
-    """
     parts = [
         f"Content: {content.content_name}",
         f"Type: {content.content_type}" if content.content_type else "",
@@ -666,10 +746,6 @@ def _build_content_text(content: ContentPayload) -> str:
     return " | ".join(p for p in parts if p)
 
 def _build_follow_up_text(follow_up: FollowUpPayload) -> str:
-    """
-    What gets embedded for a follow-up.
-    Captures who it's with, what the action is, and which venture it belongs to.
-    """
     parts = [
         f"Follow-up with: {follow_up.contact_name}",
         f"Meeting: {follow_up.meeting_name}" if follow_up.meeting_name else "",
