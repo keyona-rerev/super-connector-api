@@ -180,6 +180,34 @@ async def init_db():
             ON event_guests (contact_id);
         """)
 
+        # Buckets — user-defined contact groups
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS buckets (
+                bucket_id TEXT PRIMARY KEY,
+                data JSONB NOT NULL,
+                created_at TIMESTAMP DEFAULT NOW(),
+                updated_at TIMESTAMP DEFAULT NOW()
+            );
+        """)
+
+        # Contact Buckets — many-to-many join: contacts <-> buckets
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS contact_buckets (
+                bucket_id TEXT NOT NULL,
+                contact_id TEXT NOT NULL,
+                added_at TIMESTAMP DEFAULT NOW(),
+                PRIMARY KEY (bucket_id, contact_id)
+            );
+        """)
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS contact_buckets_contact_idx
+            ON contact_buckets (contact_id);
+        """)
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS contact_buckets_bucket_idx
+            ON contact_buckets (bucket_id);
+        """)
+
     finally:
         await conn.close()
 
@@ -219,6 +247,14 @@ async def get_all_contacts(limit: int = 50, offset: int = 0):
             limit, offset
         )
         return [{"contact_id": r["contact_id"], **json.loads(r["profile"])} for r in rows]
+    finally:
+        await conn.close()
+
+async def count_contacts():
+    conn = await _conn()
+    try:
+        row = await conn.fetchrow("SELECT COUNT(*) AS n FROM contacts")
+        return row["n"]
     finally:
         await conn.close()
 
@@ -775,5 +811,117 @@ async def delete_event_guest(guest_id: str):
     conn = await _conn()
     try:
         await conn.execute("DELETE FROM event_guests WHERE guest_id = $1", guest_id)
+    finally:
+        await conn.close()
+
+# ── BUCKETS ───────────────────────────────────────────────────────────────────
+
+async def upsert_bucket(bucket_id: str, data: dict):
+    conn = await _conn()
+    try:
+        await conn.execute("""
+            INSERT INTO buckets (bucket_id, data, updated_at)
+            VALUES ($1, $2, NOW())
+            ON CONFLICT (bucket_id)
+            DO UPDATE SET data = EXCLUDED.data, updated_at = NOW();
+        """, bucket_id, json.dumps(data))
+    finally:
+        await conn.close()
+
+async def get_all_buckets():
+    """Return all buckets with their member contact_ids."""
+    conn = await _conn()
+    try:
+        rows = await conn.fetch(
+            "SELECT bucket_id, data FROM buckets ORDER BY updated_at DESC"
+        )
+        buckets = []
+        for r in rows:
+            b = {"bucket_id": r["bucket_id"], **json.loads(r["data"])}
+            members = await conn.fetch(
+                "SELECT contact_id FROM contact_buckets WHERE bucket_id = $1", r["bucket_id"]
+            )
+            b["contact_ids"] = [m["contact_id"] for m in members]
+            b["count"] = len(b["contact_ids"])
+            buckets.append(b)
+        return buckets
+    finally:
+        await conn.close()
+
+async def get_bucket(bucket_id: str):
+    conn = await _conn()
+    try:
+        row = await conn.fetchrow(
+            "SELECT data FROM buckets WHERE bucket_id = $1", bucket_id
+        )
+        if not row:
+            return None
+        b = {"bucket_id": bucket_id, **json.loads(row["data"])}
+        members = await conn.fetch(
+            "SELECT contact_id FROM contact_buckets WHERE bucket_id = $1", bucket_id
+        )
+        b["contact_ids"] = [m["contact_id"] for m in members]
+        b["count"] = len(b["contact_ids"])
+        return b
+    finally:
+        await conn.close()
+
+async def delete_bucket(bucket_id: str):
+    conn = await _conn()
+    try:
+        # Remove all memberships first, then the bucket
+        await conn.execute("DELETE FROM contact_buckets WHERE bucket_id = $1", bucket_id)
+        await conn.execute("DELETE FROM buckets WHERE bucket_id = $1", bucket_id)
+    finally:
+        await conn.close()
+
+async def add_contact_to_bucket(bucket_id: str, contact_id: str):
+    conn = await _conn()
+    try:
+        await conn.execute("""
+            INSERT INTO contact_buckets (bucket_id, contact_id)
+            VALUES ($1, $2)
+            ON CONFLICT (bucket_id, contact_id) DO NOTHING;
+        """, bucket_id, contact_id)
+    finally:
+        await conn.close()
+
+async def remove_contact_from_bucket(bucket_id: str, contact_id: str):
+    conn = await _conn()
+    try:
+        await conn.execute(
+            "DELETE FROM contact_buckets WHERE bucket_id = $1 AND contact_id = $2",
+            bucket_id, contact_id
+        )
+    finally:
+        await conn.close()
+
+async def get_buckets_for_contact(contact_id: str):
+    """All buckets a contact belongs to."""
+    conn = await _conn()
+    try:
+        rows = await conn.fetch("""
+            SELECT b.bucket_id, b.data
+            FROM buckets b
+            JOIN contact_buckets cb ON b.bucket_id = cb.bucket_id
+            WHERE cb.contact_id = $1
+            ORDER BY b.updated_at DESC
+        """, contact_id)
+        return [{"bucket_id": r["bucket_id"], **json.loads(r["data"])} for r in rows]
+    finally:
+        await conn.close()
+
+async def get_contacts_in_bucket(bucket_id: str):
+    """Full contact profiles for everyone in a bucket."""
+    conn = await _conn()
+    try:
+        rows = await conn.fetch("""
+            SELECT c.contact_id, c.profile
+            FROM contacts c
+            JOIN contact_buckets cb ON c.contact_id = cb.contact_id
+            WHERE cb.bucket_id = $1
+            ORDER BY c.updated_at DESC
+        """, bucket_id)
+        return [{"contact_id": r["contact_id"], **json.loads(r["profile"])} for r in rows]
     finally:
         await conn.close()
