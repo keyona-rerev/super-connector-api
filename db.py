@@ -17,7 +17,7 @@ async def init_db():
     try:
         await conn.execute("CREATE EXTENSION IF NOT EXISTS vector;")
 
-        # Contacts (existing)
+        # Contacts
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS contacts (
                 contact_id TEXT PRIMARY KEY,
@@ -57,7 +57,7 @@ async def init_db():
             ON sub_projects (initiative_id);
         """)
 
-        # Stakeholders (junction: contacts <-> initiatives)
+        # Stakeholders
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS stakeholders (
                 stakeholder_id TEXT PRIMARY KEY,
@@ -107,7 +107,7 @@ async def init_db():
             ON action_items (stakeholder_id);
         """)
 
-        # Content Registry — vectorized so assets are semantically searchable
+        # Content Registry
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS content (
                 content_id TEXT PRIMARY KEY,
@@ -122,7 +122,7 @@ async def init_db():
             WITH (lists = 10);
         """)
 
-        # Follow-Ups — vectorized so follow-ups are semantically searchable
+        # Follow-Ups
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS follow_ups (
                 follow_up_id TEXT PRIMARY KEY,
@@ -142,7 +142,7 @@ async def init_db():
             WITH (lists = 10);
         """)
 
-        # Events — panels, workshops, networking; NOT interview episodes (those are sub-projects)
+        # Events
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS events (
                 event_id TEXT PRIMARY KEY,
@@ -160,7 +160,7 @@ async def init_db():
             ON events ((data->>'event_type'));
         """)
 
-        # Event Guests — contacts linked to an event with a role + status
+        # Event Guests
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS event_guests (
                 guest_id TEXT PRIMARY KEY,
@@ -180,7 +180,7 @@ async def init_db():
             ON event_guests (contact_id);
         """)
 
-        # Buckets — user-defined contact groups
+        # Buckets — user-defined contact groups, optionally linked to an initiative
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS buckets (
                 bucket_id TEXT PRIMARY KEY,
@@ -188,6 +188,11 @@ async def init_db():
                 created_at TIMESTAMP DEFAULT NOW(),
                 updated_at TIMESTAMP DEFAULT NOW()
             );
+        """)
+        # Migration: add initiative_id index on buckets.data if not already present
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS buckets_initiative_idx
+            ON buckets ((data->>'initiative_id'));
         """)
 
         # Contact Buckets — many-to-many join: contacts <-> buckets
@@ -416,7 +421,6 @@ async def get_stakeholders_for_initiative(initiative_id: str):
         await conn.close()
 
 async def get_stakeholders_for_contact(contact_id: str):
-    """Get all initiatives a contact is involved in — powers cross-initiative surfacing."""
     conn = await _conn()
     try:
         rows = await conn.fetch(
@@ -495,7 +499,6 @@ async def get_action_items_for_initiative(initiative_id: str):
         await conn.close()
 
 async def get_open_action_items(due_before: str = None):
-    """Used by Phoebe for check-ins and due date warnings."""
     conn = await _conn()
     try:
         if due_before:
@@ -522,7 +525,6 @@ async def get_open_action_items(due_before: str = None):
         await conn.close()
 
 async def get_action_item_by_google_task_id(google_task_id: str):
-    """Two-way Google Tasks sync — look up by task ID."""
     conn = await _conn()
     try:
         row = await conn.fetchrow("""
@@ -543,7 +545,6 @@ async def delete_action_item(action_id: str):
 # ── CONTENT ───────────────────────────────────────────────────────────────────
 
 async def store_content(content_id: str, data: dict, vector: list):
-    """Upsert a content asset with its embedding."""
     import numpy as np
     conn = await _conn()
     try:
@@ -580,7 +581,6 @@ async def get_all_content():
         await conn.close()
 
 async def search_content_by_vector(vector: list, limit: int = 10):
-    """Semantic search across content assets — e.g. 'Prismm community bank article'."""
     import numpy as np
     conn = await _conn()
     try:
@@ -610,7 +610,6 @@ async def delete_content(content_id: str):
 # ── FOLLOW-UPS ────────────────────────────────────────────────────────────────
 
 async def store_follow_up(follow_up_id: str, contact_id: str, data: dict, vector: list):
-    """Upsert a follow-up with its embedding."""
     import numpy as np
     conn = await _conn()
     try:
@@ -638,7 +637,6 @@ async def get_follow_up(follow_up_id: str):
         await conn.close()
 
 async def get_open_follow_ups():
-    """All follow-ups with status = Open — used by Phoebe Monday scan."""
     conn = await _conn()
     try:
         rows = await conn.fetch("""
@@ -655,7 +653,6 @@ async def get_open_follow_ups():
         await conn.close()
 
 async def get_overdue_follow_ups(as_of_date: str):
-    """Follow-ups where next_action_date has passed and status is still Open."""
     conn = await _conn()
     try:
         rows = await conn.fetch("""
@@ -686,7 +683,6 @@ async def get_follow_ups_for_contact(contact_id: str):
         await conn.close()
 
 async def search_follow_ups_by_vector(vector: list, limit: int = 10):
-    """Semantic search — e.g. 'who do I owe a follow-up about climate tech?'"""
     import numpy as np
     conn = await _conn()
     try:
@@ -739,7 +735,6 @@ async def get_event(event_id: str):
         await conn.close()
 
 async def get_all_events(event_type: str = None, venture: str = None):
-    """List all events, optionally filtered by type and/or venture."""
     conn = await _conn()
     try:
         if event_type and venture:
@@ -829,7 +824,6 @@ async def upsert_bucket(bucket_id: str, data: dict):
         await conn.close()
 
 async def get_all_buckets():
-    """Return all buckets with their member contact_ids."""
     conn = await _conn()
     try:
         rows = await conn.fetch(
@@ -866,10 +860,31 @@ async def get_bucket(bucket_id: str):
     finally:
         await conn.close()
 
+async def get_buckets_for_initiative(initiative_id: str):
+    """All buckets linked to a specific initiative."""
+    conn = await _conn()
+    try:
+        rows = await conn.fetch("""
+            SELECT bucket_id, data FROM buckets
+            WHERE data->>'initiative_id' = $1
+            ORDER BY updated_at DESC
+        """, initiative_id)
+        buckets = []
+        for r in rows:
+            b = {"bucket_id": r["bucket_id"], **json.loads(r["data"])}
+            members = await conn.fetch(
+                "SELECT contact_id FROM contact_buckets WHERE bucket_id = $1", r["bucket_id"]
+            )
+            b["contact_ids"] = [m["contact_id"] for m in members]
+            b["count"] = len(b["contact_ids"])
+            buckets.append(b)
+        return buckets
+    finally:
+        await conn.close()
+
 async def delete_bucket(bucket_id: str):
     conn = await _conn()
     try:
-        # Remove all memberships first, then the bucket
         await conn.execute("DELETE FROM contact_buckets WHERE bucket_id = $1", bucket_id)
         await conn.execute("DELETE FROM buckets WHERE bucket_id = $1", bucket_id)
     finally:
@@ -897,7 +912,6 @@ async def remove_contact_from_bucket(bucket_id: str, contact_id: str):
         await conn.close()
 
 async def get_buckets_for_contact(contact_id: str):
-    """All buckets a contact belongs to."""
     conn = await _conn()
     try:
         rows = await conn.fetch("""
@@ -912,7 +926,6 @@ async def get_buckets_for_contact(contact_id: str):
         await conn.close()
 
 async def get_contacts_in_bucket(bucket_id: str):
-    """Full contact profiles for everyone in a bucket."""
     conn = await _conn()
     try:
         rows = await conn.fetch("""
@@ -925,3 +938,89 @@ async def get_contacts_in_bucket(bucket_id: str):
         return [{"contact_id": r["contact_id"], **json.loads(r["profile"])} for r in rows]
     finally:
         await conn.close()
+
+# ── BRAIN DUMP ────────────────────────────────────────────────────────────────
+
+async def brain_dump_insert(
+    initiatives: list,
+    sub_projects: list,
+    contacts: list,
+    action_items: list
+):
+    """
+    Batch insert for brain dump sessions.
+    Each item in initiatives/sub_projects/contacts/action_items is a dict
+    with all required fields pre-populated by the caller.
+    Returns a results dict with counts and any errors.
+    """
+    results = {
+        "initiatives": {"ok": 0, "errors": []},
+        "sub_projects": {"ok": 0, "errors": []},
+        "contacts":     {"ok": 0, "errors": []},
+        "action_items": {"ok": 0, "errors": []},
+    }
+
+    conn = await _conn()
+    try:
+        for ini in initiatives:
+            try:
+                initiative_id = ini.get("initiative_id")
+                await conn.execute("""
+                    INSERT INTO initiatives (initiative_id, data, updated_at)
+                    VALUES ($1, $2, NOW())
+                    ON CONFLICT (initiative_id)
+                    DO UPDATE SET data = EXCLUDED.data, updated_at = NOW();
+                """, initiative_id, json.dumps(ini))
+                results["initiatives"]["ok"] += 1
+            except Exception as e:
+                results["initiatives"]["errors"].append(
+                    {"id": ini.get("initiative_id"), "error": str(e)}
+                )
+
+        for sub in sub_projects:
+            try:
+                await conn.execute("""
+                    INSERT INTO sub_projects (sub_project_id, initiative_id, data, updated_at)
+                    VALUES ($1, $2, $3, NOW())
+                    ON CONFLICT (sub_project_id)
+                    DO UPDATE SET data = EXCLUDED.data, updated_at = NOW();
+                """, sub["sub_project_id"], sub["initiative_id"], json.dumps(sub))
+                results["sub_projects"]["ok"] += 1
+            except Exception as e:
+                results["sub_projects"]["errors"].append(
+                    {"id": sub.get("sub_project_id"), "error": str(e)}
+                )
+
+        for c in contacts:
+            try:
+                await conn.execute("""
+                    INSERT INTO contacts (contact_id, profile, updated_at)
+                    VALUES ($1, $2, NOW())
+                    ON CONFLICT (contact_id)
+                    DO UPDATE SET profile = EXCLUDED.profile, updated_at = NOW();
+                """, c["contact_id"], json.dumps(c))
+                results["contacts"]["ok"] += 1
+            except Exception as e:
+                results["contacts"]["errors"].append(
+                    {"id": c.get("contact_id"), "error": str(e)}
+                )
+
+        for item in action_items:
+            try:
+                await conn.execute("""
+                    INSERT INTO action_items (action_id, initiative_id, stakeholder_id, data, updated_at)
+                    VALUES ($1, $2, $3, $4, NOW())
+                    ON CONFLICT (action_id)
+                    DO UPDATE SET data = EXCLUDED.data, updated_at = NOW();
+                """, item["action_id"], item.get("initiative_id", "SPRINT"),
+                    item.get("stakeholder_id", ""), json.dumps(item))
+                results["action_items"]["ok"] += 1
+            except Exception as e:
+                results["action_items"]["errors"].append(
+                    {"id": item.get("action_id"), "error": str(e)}
+                )
+
+    finally:
+        await conn.close()
+
+    return results
