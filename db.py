@@ -142,6 +142,44 @@ async def init_db():
             WITH (lists = 10);
         """)
 
+        # Events — panels, workshops, networking; NOT interview episodes (those are sub-projects)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS events (
+                event_id TEXT PRIMARY KEY,
+                data JSONB NOT NULL,
+                created_at TIMESTAMP DEFAULT NOW(),
+                updated_at TIMESTAMP DEFAULT NOW()
+            );
+        """)
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS events_venture_idx
+            ON events ((data->>'venture'));
+        """)
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS events_type_idx
+            ON events ((data->>'event_type'));
+        """)
+
+        # Event Guests — contacts linked to an event with a role + status
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS event_guests (
+                guest_id TEXT PRIMARY KEY,
+                event_id TEXT NOT NULL,
+                contact_id TEXT,
+                data JSONB NOT NULL,
+                created_at TIMESTAMP DEFAULT NOW(),
+                updated_at TIMESTAMP DEFAULT NOW()
+            );
+        """)
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS event_guests_event_idx
+            ON event_guests (event_id);
+        """)
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS event_guests_contact_idx
+            ON event_guests (contact_id);
+        """)
+
     finally:
         await conn.close()
 
@@ -637,5 +675,105 @@ async def delete_follow_up(follow_up_id: str):
     conn = await _conn()
     try:
         await conn.execute("DELETE FROM follow_ups WHERE follow_up_id = $1", follow_up_id)
+    finally:
+        await conn.close()
+
+# ── EVENTS ────────────────────────────────────────────────────────────────────
+
+async def upsert_event(event_id: str, data: dict):
+    conn = await _conn()
+    try:
+        await conn.execute("""
+            INSERT INTO events (event_id, data, updated_at)
+            VALUES ($1, $2, NOW())
+            ON CONFLICT (event_id)
+            DO UPDATE SET data = EXCLUDED.data, updated_at = NOW();
+        """, event_id, json.dumps(data))
+    finally:
+        await conn.close()
+
+async def get_event(event_id: str):
+    conn = await _conn()
+    try:
+        row = await conn.fetchrow(
+            "SELECT data FROM events WHERE event_id = $1", event_id
+        )
+        return json.loads(row["data"]) if row else None
+    finally:
+        await conn.close()
+
+async def get_all_events(event_type: str = None, venture: str = None):
+    """List all events, optionally filtered by type and/or venture."""
+    conn = await _conn()
+    try:
+        if event_type and venture:
+            rows = await conn.fetch("""
+                SELECT event_id, data FROM events
+                WHERE data->>'event_type' = $1 AND data->>'venture' = $2
+                ORDER BY data->>'date' DESC NULLS LAST
+            """, event_type, venture)
+        elif event_type:
+            rows = await conn.fetch("""
+                SELECT event_id, data FROM events
+                WHERE data->>'event_type' = $1
+                ORDER BY data->>'date' DESC NULLS LAST
+            """, event_type)
+        elif venture:
+            rows = await conn.fetch("""
+                SELECT event_id, data FROM events
+                WHERE data->>'venture' = $1
+                ORDER BY data->>'date' DESC NULLS LAST
+            """, venture)
+        else:
+            rows = await conn.fetch(
+                "SELECT event_id, data FROM events ORDER BY data->>'date' DESC NULLS LAST"
+            )
+        return [{"event_id": r["event_id"], **json.loads(r["data"])} for r in rows]
+    finally:
+        await conn.close()
+
+async def delete_event(event_id: str):
+    conn = await _conn()
+    try:
+        await conn.execute("DELETE FROM events WHERE event_id = $1", event_id)
+    finally:
+        await conn.close()
+
+# ── EVENT GUESTS ──────────────────────────────────────────────────────────────
+
+async def upsert_event_guest(guest_id: str, event_id: str, contact_id: str, data: dict):
+    conn = await _conn()
+    try:
+        await conn.execute("""
+            INSERT INTO event_guests (guest_id, event_id, contact_id, data, updated_at)
+            VALUES ($1, $2, $3, $4, NOW())
+            ON CONFLICT (guest_id)
+            DO UPDATE SET
+                contact_id = EXCLUDED.contact_id,
+                data = EXCLUDED.data,
+                updated_at = NOW();
+        """, guest_id, event_id, contact_id or "", json.dumps(data))
+    finally:
+        await conn.close()
+
+async def get_guests_for_event(event_id: str):
+    conn = await _conn()
+    try:
+        rows = await conn.fetch(
+            "SELECT guest_id, contact_id, data FROM event_guests WHERE event_id = $1 ORDER BY updated_at ASC",
+            event_id
+        )
+        return [
+            {"guest_id": r["guest_id"], "contact_id": r["contact_id"],
+             **json.loads(r["data"])}
+            for r in rows
+        ]
+    finally:
+        await conn.close()
+
+async def delete_event_guest(guest_id: str):
+    conn = await _conn()
+    try:
+        await conn.execute("DELETE FROM event_guests WHERE guest_id = $1", guest_id)
     finally:
         await conn.close()
