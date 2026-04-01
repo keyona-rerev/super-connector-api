@@ -17,7 +17,6 @@ async def init_db():
     try:
         await conn.execute("CREATE EXTENSION IF NOT EXISTS vector;")
 
-        # Contacts
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS contacts (
                 contact_id TEXT PRIMARY KEY,
@@ -31,8 +30,12 @@ async def init_db():
             ON contacts USING ivfflat (embedding vector_cosine_ops)
             WITH (lists = 100);
         """)
+        # GIN index for fast full-text search across the whole profile JSONB
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS contacts_profile_gin_idx
+            ON contacts USING gin (profile);
+        """)
 
-        # Initiatives
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS initiatives (
                 initiative_id TEXT PRIMARY KEY,
@@ -42,7 +45,6 @@ async def init_db():
             );
         """)
 
-        # Sub-Projects
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS sub_projects (
                 sub_project_id TEXT PRIMARY KEY,
@@ -57,7 +59,6 @@ async def init_db():
             ON sub_projects (initiative_id);
         """)
 
-        # Stakeholders
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS stakeholders (
                 stakeholder_id TEXT PRIMARY KEY,
@@ -77,7 +78,6 @@ async def init_db():
             ON stakeholders (contact_id);
         """)
 
-        # Activation Angles
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS activation_angles (
                 angle_id TEXT PRIMARY KEY,
@@ -87,7 +87,6 @@ async def init_db():
             );
         """)
 
-        # Action Items
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS action_items (
                 action_id TEXT PRIMARY KEY,
@@ -107,7 +106,6 @@ async def init_db():
             ON action_items (stakeholder_id);
         """)
 
-        # Content Registry
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS content (
                 content_id TEXT PRIMARY KEY,
@@ -122,7 +120,6 @@ async def init_db():
             WITH (lists = 10);
         """)
 
-        # Follow-Ups
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS follow_ups (
                 follow_up_id TEXT PRIMARY KEY,
@@ -142,7 +139,6 @@ async def init_db():
             WITH (lists = 10);
         """)
 
-        # Events
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS events (
                 event_id TEXT PRIMARY KEY,
@@ -160,7 +156,6 @@ async def init_db():
             ON events ((data->>'event_type'));
         """)
 
-        # Event Guests
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS event_guests (
                 guest_id TEXT PRIMARY KEY,
@@ -180,7 +175,7 @@ async def init_db():
             ON event_guests (contact_id);
         """)
 
-        # Buckets — user-defined contact groups, optionally linked to an initiative
+        # Buckets — optionally linked to an initiative
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS buckets (
                 bucket_id TEXT PRIMARY KEY,
@@ -189,13 +184,11 @@ async def init_db():
                 updated_at TIMESTAMP DEFAULT NOW()
             );
         """)
-        # Migration: add initiative_id index on buckets.data if not already present
         await conn.execute("""
             CREATE INDEX IF NOT EXISTS buckets_initiative_idx
             ON buckets ((data->>'initiative_id'));
         """)
 
-        # Contact Buckets — many-to-many join: contacts <-> buckets
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS contact_buckets (
                 bucket_id TEXT NOT NULL,
@@ -260,6 +253,34 @@ async def count_contacts():
     try:
         row = await conn.fetchrow("SELECT COUNT(*) AS n FROM contacts")
         return row["n"]
+    finally:
+        await conn.close()
+
+async def text_search_contacts(query: str, limit: int = 50):
+    """
+    Simple text search across name, organization, title_role, notes, venture.
+    Uses ILIKE for case-insensitive substring matching — this is the 'type a name and find them' path.
+    Returns contacts where ANY of those fields contain the query string.
+    """
+    conn = await _conn()
+    try:
+        q = f"%{query}%"
+        rows = await conn.fetch("""
+            SELECT contact_id, profile FROM contacts
+            WHERE
+                profile->>'full_name'   ILIKE $1 OR
+                profile->>'organization' ILIKE $1 OR
+                profile->>'title_role'  ILIKE $1 OR
+                profile->>'notes'       ILIKE $1 OR
+                profile->>'venture'     ILIKE $1 OR
+                profile->>'how_we_met'  ILIKE $1 OR
+                profile->>'source'      ILIKE $1
+            ORDER BY
+                CASE WHEN profile->>'full_name' ILIKE $1 THEN 0 ELSE 1 END,
+                updated_at DESC
+            LIMIT $2
+        """, q, limit)
+        return [{"contact_id": r["contact_id"], **json.loads(r["profile"])} for r in rows]
     finally:
         await conn.close()
 
@@ -861,7 +882,6 @@ async def get_bucket(bucket_id: str):
         await conn.close()
 
 async def get_buckets_for_initiative(initiative_id: str):
-    """All buckets linked to a specific initiative."""
     conn = await _conn()
     try:
         rows = await conn.fetch("""
@@ -941,41 +961,26 @@ async def get_contacts_in_bucket(bucket_id: str):
 
 # ── BRAIN DUMP ────────────────────────────────────────────────────────────────
 
-async def brain_dump_insert(
-    initiatives: list,
-    sub_projects: list,
-    contacts: list,
-    action_items: list
-):
-    """
-    Batch insert for brain dump sessions.
-    Each item in initiatives/sub_projects/contacts/action_items is a dict
-    with all required fields pre-populated by the caller.
-    Returns a results dict with counts and any errors.
-    """
+async def brain_dump_insert(initiatives, sub_projects, contacts, action_items):
     results = {
         "initiatives": {"ok": 0, "errors": []},
         "sub_projects": {"ok": 0, "errors": []},
         "contacts":     {"ok": 0, "errors": []},
         "action_items": {"ok": 0, "errors": []},
     }
-
     conn = await _conn()
     try:
         for ini in initiatives:
             try:
-                initiative_id = ini.get("initiative_id")
                 await conn.execute("""
                     INSERT INTO initiatives (initiative_id, data, updated_at)
                     VALUES ($1, $2, NOW())
                     ON CONFLICT (initiative_id)
                     DO UPDATE SET data = EXCLUDED.data, updated_at = NOW();
-                """, initiative_id, json.dumps(ini))
+                """, ini.get("initiative_id"), json.dumps(ini))
                 results["initiatives"]["ok"] += 1
             except Exception as e:
-                results["initiatives"]["errors"].append(
-                    {"id": ini.get("initiative_id"), "error": str(e)}
-                )
+                results["initiatives"]["errors"].append({"id": ini.get("initiative_id"), "error": str(e)})
 
         for sub in sub_projects:
             try:
@@ -987,9 +992,7 @@ async def brain_dump_insert(
                 """, sub["sub_project_id"], sub["initiative_id"], json.dumps(sub))
                 results["sub_projects"]["ok"] += 1
             except Exception as e:
-                results["sub_projects"]["errors"].append(
-                    {"id": sub.get("sub_project_id"), "error": str(e)}
-                )
+                results["sub_projects"]["errors"].append({"id": sub.get("sub_project_id"), "error": str(e)})
 
         for c in contacts:
             try:
@@ -1001,9 +1004,7 @@ async def brain_dump_insert(
                 """, c["contact_id"], json.dumps(c))
                 results["contacts"]["ok"] += 1
             except Exception as e:
-                results["contacts"]["errors"].append(
-                    {"id": c.get("contact_id"), "error": str(e)}
-                )
+                results["contacts"]["errors"].append({"id": c.get("contact_id"), "error": str(e)})
 
         for item in action_items:
             try:
@@ -1016,11 +1017,7 @@ async def brain_dump_insert(
                     item.get("stakeholder_id", ""), json.dumps(item))
                 results["action_items"]["ok"] += 1
             except Exception as e:
-                results["action_items"]["errors"].append(
-                    {"id": item.get("action_id"), "error": str(e)}
-                )
-
+                results["action_items"]["errors"].append({"id": item.get("action_id"), "error": str(e)})
     finally:
         await conn.close()
-
     return results
