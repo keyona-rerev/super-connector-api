@@ -122,7 +122,7 @@ class BucketFromSearchPayload(BaseModel):
 
 class BucketEnrichPayload(BaseModel):
     campaign_context: str
-    batch_size: Optional[int] = 5
+    batch_size: Optional[int] = 1  # Default to 1 for rate limit safety
     offset: Optional[int] = 0
     write_back: Optional[bool] = True
 
