@@ -9,34 +9,23 @@ import asyncio
 
 from db import (
     init_db,
-    # contacts
     store_contact, get_contact, get_all_contacts, count_contacts, delete_contact,
     find_similar, find_similar_by_vector, text_search_contacts,
-    # initiatives
     upsert_initiative, get_initiative, get_all_initiatives, delete_initiative,
-    # sub-projects
     upsert_sub_project, get_sub_projects_for_initiative, delete_sub_project,
-    # stakeholders
     upsert_stakeholder, get_stakeholders_for_initiative,
     get_stakeholders_for_contact, delete_stakeholder,
-    # activation angles
     upsert_activation_angle, get_all_activation_angles, delete_activation_angle,
-    # action items
     upsert_action_item, get_action_items_for_initiative,
     get_open_action_items, get_action_item_by_google_task_id, delete_action_item,
-    # content
     store_content, get_content, get_all_content, search_content_by_vector, delete_content,
-    # follow-ups
     store_follow_up, get_follow_up, get_open_follow_ups, get_overdue_follow_ups,
     get_follow_ups_for_contact, search_follow_ups_by_vector, delete_follow_up,
-    # events
     upsert_event, get_event, get_all_events, delete_event,
     upsert_event_guest, get_guests_for_event, delete_event_guest,
-    # buckets
     upsert_bucket, get_all_buckets, get_bucket, delete_bucket,
     add_contact_to_bucket, remove_contact_from_bucket,
     get_buckets_for_contact, get_contacts_in_bucket, get_buckets_for_initiative,
-    # brain dump
     brain_dump_insert,
 )
 from embedder import embed_profile, embed_query
@@ -57,7 +46,6 @@ from models import (
 
 app = FastAPI(title="Super Connector API")
 
-# ── CORS ──────────────────────────────────────────────────────────────────────
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -66,7 +54,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── AUTH ──────────────────────────────────────────────────────────────────────
 API_KEY_NAME = "X-API-Key"
 api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=True)
 
@@ -78,7 +65,6 @@ def require_api_key(key: str = Security(api_key_header)):
         raise HTTPException(status_code=401, detail="Invalid API key")
     return key
 
-# ── STARTUP ───────────────────────────────────────────────────────────────────
 @app.on_event("startup")
 async def startup():
     await init_db()
@@ -124,30 +110,18 @@ class BucketMemberPayload(BaseModel):
     contact_id: str
 
 class BucketFromSearchPayload(BaseModel):
-    """
-    Conversational bucket creation.
-    Provide a natural language description of who you want in the bucket.
-    The API will run a semantic search, create the bucket, and populate it.
-    Returns the bucket + matched contacts for your review before committing.
-    """
-    description: str                          # e.g. "accelerator operators and program directors"
-    bucket_name: str                          # e.g. "Accelerator Operators"
+    description: str
+    bucket_name: str
     bucket_color: Optional[str] = "#6BC47F"
     initiative_id: Optional[str] = ""
-    top_k: Optional[int] = 20                # how many contacts to surface
-    auto_commit: Optional[bool] = False       # if True, creates bucket and adds all matches immediately
-                                              # if False (default), returns matches for human review
+    top_k: Optional[int] = 20
+    auto_commit: Optional[bool] = False
 
 class BucketEnrichPayload(BaseModel):
-    """
-    Triggers the enrichment + outreach drafting pipeline for all contacts in a bucket.
-    campaign_context: describe the angle of the outreach in plain English.
-    batch_size: how many contacts to process per call (to manage API rate limits / cost).
-    """
     campaign_context: str
-    batch_size: Optional[int] = 5            # process N contacts per call; call again with offset for more
+    batch_size: Optional[int] = 5
     offset: Optional[int] = 0
-    write_back: Optional[bool] = True        # if True, writes enrichment back to contact notes in Railway
+    write_back: Optional[bool] = True
 
 # ── BRAIN DUMP MODELS ─────────────────────────────────────────────────────────
 class BrainDumpSubProject(BaseModel):
@@ -193,6 +167,66 @@ class BrainDumpPayload(BaseModel):
     initiatives: Optional[List[BrainDumpInitiative]] = []
     contacts: Optional[List[BrainDumpContact]] = []
     action_items: Optional[List[BrainDumpActionItem]] = []
+
+# ── HELPERS ───────────────────────────────────────────────────────────────────
+
+def _is_founder_role(role: str) -> bool:
+    """
+    Returns True if the role suggests the person is building something themselves.
+    Returns False for operators, employees, staff, program managers, directors at orgs, etc.
+    Used to decide whether to write org_description into what_building on write-back.
+    """
+    if not role:
+        return False
+    role_lower = role.lower()
+    founder_signals = ['founder', 'co-founder', 'ceo', 'cto', 'coo', 'creator', 'building', 'started']
+    operator_signals = ['program manager', 'program director', 'managing director', 'associate',
+                        'vice president', 'vp', 'manager', 'director', 'coordinator', 'staff',
+                        'analyst', 'officer', 'lead', 'partner', 'principal', 'fellow']
+    for s in founder_signals:
+        if s in role_lower:
+            return True
+    # If it matches operator signals and NOT founder signals, return False
+    for s in operator_signals:
+        if s in role_lower:
+            return False
+    return False
+
+def _build_profile_text(contact: ContactPayload) -> str:
+    parts = [
+        f"Name: {contact.full_name}",
+        f"Role: {contact.title_role}" if contact.title_role else "",
+        f"Organization: {contact.organization}" if contact.organization else "",
+        f"Venture context: {contact.venture}" if contact.venture else "",
+        f"How we met: {contact.how_we_met}" if contact.how_we_met else "",
+        f"What they're building: {contact.what_building}" if contact.what_building else "",
+        f"What they need: {contact.what_need}" if contact.what_need else "",
+        f"What they offer: {contact.what_offer}" if contact.what_offer else "",
+        f"Met at: {contact.source}" if contact.source else "",
+        f"Notes: {contact.notes}" if contact.notes else "",
+    ]
+    return " | ".join(p for p in parts if p)
+
+def _build_content_text(content: ContentPayload) -> str:
+    parts = [
+        f"Content: {content.content_name}",
+        f"Type: {content.content_type}" if content.content_type else "",
+        f"Venture: {content.venture}" if content.venture else "",
+        f"Initiatives: {content.initiative_tags}" if content.initiative_tags else "",
+        f"Purpose: {content.activation_angle}" if content.activation_angle else "",
+        f"Notes: {content.notes}" if content.notes else "",
+    ]
+    return " | ".join(p for p in parts if p)
+
+def _build_follow_up_text(follow_up: FollowUpPayload) -> str:
+    parts = [
+        f"Follow-up with: {follow_up.contact_name}",
+        f"Meeting: {follow_up.meeting_name}" if follow_up.meeting_name else "",
+        f"Action needed: {follow_up.next_action}" if follow_up.next_action else "",
+        f"Venture: {follow_up.venture}" if follow_up.venture else "",
+        f"Notes: {follow_up.notes}" if follow_up.notes else "",
+    ]
+    return " | ".join(p for p in parts if p)
 
 # ── OPEN ENDPOINTS ────────────────────────────────────────────────────────────
 @app.get("/health")
@@ -306,11 +340,6 @@ async def list_contacts(limit: int = 50, offset: int = 0):
 
 @app.get("/contacts/search", dependencies=[Depends(require_api_key)])
 async def text_search(q: str, limit: int = 50):
-    """
-    Simple text search — substring match on name, org, role, notes, venture, how_we_met, source.
-    This is the 'type a name and find them instantly' path. No embeddings, no AI, just ILIKE.
-    Name matches are ranked first.
-    """
     if not q or not q.strip():
         raise HTTPException(status_code=400, detail="Query parameter 'q' is required")
     results = await text_search_contacts(q.strip(), limit=limit)
@@ -330,11 +359,6 @@ async def match_contact(contact_id: str, limit: int = 5):
 
 @app.post("/search", dependencies=[Depends(require_api_key)])
 async def search_contacts(request: SearchRequest):
-    """
-    Semantic search — use embed_query (not embed_profile) for correct Voyage AI query mode.
-    Use this for descriptive queries like 'climate tech founder in NYC'.
-    For name/text lookups use GET /contacts/search?q= instead.
-    """
     try:
         vector = embed_query(request.query)
         results = await find_matches_by_vector(vector, limit=request.top_k)
@@ -418,46 +442,23 @@ async def remove_bucket(bucket_id: str):
     await delete_bucket(bucket_id)
     return {"success": True}
 
-# ── NETWORK ACTIVATION: CONVERSATIONAL BUCKET CREATION ───────────────────────
-
 @app.post("/bucket/from-search", dependencies=[Depends(require_api_key)])
 async def create_bucket_from_search(payload: BucketFromSearchPayload):
-    """
-    Conversational bucket creation.
-
-    Give it a natural language description of who you want (e.g. 'accelerator operators
-    and program directors') and a name for the bucket. It will:
-    1. Run a semantic search against all contacts
-    2. Return the matches for human review (default)
-    3. If auto_commit=True, create the bucket and populate it immediately
-
-    Default behavior is review mode (auto_commit=False). Review the returned contacts,
-    then call POST /bucket to create the bucket and POST /bucket/{id}/members to add
-    contacts manually, or re-call with auto_commit=True to commit all matches at once.
-    """
     try:
-        # Semantic search for matching contacts
         vector = embed_query(payload.description)
         matches = await find_matches_by_vector(vector, limit=payload.top_k)
 
         if not payload.auto_commit:
-            # Review mode: return matches without creating anything
             return {
-                "success": True,
-                "mode": "review",
+                "success": True, "mode": "review",
                 "description": payload.description,
                 "proposed_bucket_name": payload.bucket_name,
-                "matches": matches,
-                "count": len(matches),
-                "next_step": "Review the matches above. To commit, re-call with auto_commit=true, "
-                             "or call POST /bucket then POST /bucket/{id}/members for each contact."
+                "matches": matches, "count": len(matches),
             }
 
-        # Auto-commit mode: create bucket and populate
         bucket_id = f"BKT-{int(time.time() * 1000)}"
         bucket_data = {
-            "bucket_id": bucket_id,
-            "name": payload.bucket_name,
+            "bucket_id": bucket_id, "name": payload.bucket_name,
             "description": payload.description,
             "color": payload.bucket_color or "#6BC47F",
             "initiative_id": payload.initiative_id or "",
@@ -472,98 +473,81 @@ async def create_bucket_from_search(payload: BucketFromSearchPayload):
                 added.append(contact_id)
 
         return {
-            "success": True,
-            "mode": "committed",
-            "bucket_id": bucket_id,
-            "bucket_name": payload.bucket_name,
-            "contacts_added": len(added),
-            "contacts": matches,
+            "success": True, "mode": "committed",
+            "bucket_id": bucket_id, "bucket_name": payload.bucket_name,
+            "contacts_added": len(added), "contacts": matches,
         }
-
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-
-# ── NETWORK ACTIVATION: ENRICHMENT + OUTREACH DRAFTING ───────────────────────
-
 @app.post("/bucket/{bucket_id}/enrich", dependencies=[Depends(require_api_key)])
 async def enrich_bucket(bucket_id: str, payload: BucketEnrichPayload):
-    """
-    Enrichment + personalized outreach drafting pipeline for a bucket.
-
-    For each contact in the bucket (in batches), this endpoint:
-    1. Pulls their profile from Railway
-    2. Runs Claude + web_search to research them and their organization
-    3. Drafts a personalized outreach email using the campaign_context you provide
-    4. Optionally writes the enrichment back to their contact notes in Railway
-
-    Use batch_size and offset to paginate through large buckets.
-    Each call processes batch_size contacts starting at offset.
-
-    Returns enriched profiles and email drafts ready for review and sending.
-    """
     bucket = await get_bucket(bucket_id)
     if not bucket:
         raise HTTPException(status_code=404, detail="Bucket not found")
 
     contacts = await get_contacts_in_bucket(bucket_id)
     total = len(contacts)
-
-    # Apply pagination
     batch = contacts[payload.offset: payload.offset + payload.batch_size]
 
     if not batch:
         return {
-            "success": True,
-            "bucket_id": bucket_id,
-            "total_in_bucket": total,
-            "batch_offset": payload.offset,
-            "batch_size": payload.batch_size,
-            "processed": 0,
-            "results": [],
+            "success": True, "bucket_id": bucket_id, "total_in_bucket": total,
+            "batch_offset": payload.offset, "batch_size": payload.batch_size,
+            "processed": 0, "results": [],
             "message": "No contacts in this batch. Offset may exceed bucket size."
         }
 
     results = []
     for contact in batch:
-        # Run enrichment + draft (synchronous Claude calls, run in thread pool)
         result = await asyncio.get_event_loop().run_in_executor(
             None, enrich_and_draft, contact, payload.campaign_context
         )
         results.append(result)
 
-        # Write enrichment back to contact record in Railway if requested
         if payload.write_back and result.get("enrichment", {}).get("enrichment_status") == "enriched":
             try:
                 enrichment = result["enrichment"]
                 existing = await get_contact(contact["contact_id"])
                 if existing:
-                    # Append enrichment summary to notes, preserving existing notes
-                    enrich_note = (
-                        f"\n[Enriched {time.strftime('%Y-%m-%d')}] "
-                        f"Org: {enrichment.get('org_description', '')} "
-                        f"Person: {enrichment.get('person_summary', '')} "
-                        f"Recent: {enrichment.get('org_recent_activity', '')}"
-                    ).strip()
-                    existing_notes = existing.get("notes", "") or ""
-                    # Avoid duplicate enrichment blocks
-                    if "[Enriched" not in existing_notes:
-                        existing["notes"] = (existing_notes + enrich_note).strip()
-                    # Store org_type and org_focus in what_building if empty
-                    if not existing.get("what_building") and enrichment.get("org_description"):
-                        existing["what_building"] = enrichment["org_description"]
-                    # Re-vectorize with enriched data
+                    # Build a clean enrichment note (no [Enriched] block — just update notes cleanly)
+                    org_ctx = enrichment.get("org_description", "")
+                    person_ctx = enrichment.get("person_summary", "")
+                    recent = enrichment.get("org_recent_activity", "")
+
+                    parts = []
+                    if org_ctx:
+                        parts.append(f"Org: {org_ctx}")
+                    if person_ctx:
+                        parts.append(f"Person: {person_ctx}")
+                    if recent:
+                        parts.append(f"Recent: {recent}")
+
+                    if parts:
+                        enrich_note = f"\n[Enriched {time.strftime('%Y-%m-%d')}] " + " | ".join(parts)
+                        existing_notes = existing.get("notes", "") or ""
+                        if "[Enriched" not in existing_notes:
+                            existing["notes"] = (existing_notes + enrich_note).strip()
+
+                    # ── KEY FIX: only populate what_building for actual founders/builders ──
+                    # Operators, employees, program managers, directors at orgs do NOT
+                    # "build" the organization they work for. Only write what_building if
+                    # the role clearly signals the person is founding or building something.
+                    role = existing.get("title_role", "") or ""
+                    if not existing.get("what_building") and org_ctx and _is_founder_role(role):
+                        existing["what_building"] = org_ctx
+
+                    # Re-vectorize with enriched notes
                     profile_text = " | ".join(filter(None, [
                         f"Name: {existing.get('full_name', '')}",
                         f"Role: {existing.get('title_role', '')}",
                         f"Org: {existing.get('organization', '')}",
-                        f"What building: {existing.get('what_building', '')}",
                         f"Notes: {existing.get('notes', '')}",
                     ]))
                     vector = embed_profile(profile_text)
                     await store_contact(existing["contact_id"], existing, vector)
             except Exception:
-                pass  # Write-back failure is non-fatal
+                pass
 
     has_more = (payload.offset + payload.batch_size) < total
 
@@ -599,12 +583,8 @@ async def get_initiative_by_id(initiative_id: str):
     action_items = await get_action_items_for_initiative(initiative_id)
     buckets = await get_buckets_for_initiative(initiative_id)
     return {
-        "success": True,
-        "data": data,
-        "sub_projects": sub_projects,
-        "stakeholders": stakeholders,
-        "action_items": action_items,
-        "buckets": buckets,
+        "success": True, "data": data, "sub_projects": sub_projects,
+        "stakeholders": stakeholders, "action_items": action_items, "buckets": buckets,
     }
 
 @app.post("/initiative", dependencies=[Depends(require_api_key)])
@@ -1079,41 +1059,3 @@ async def update_event_guest(guest_id: str, payload: EventGuestUpdate):
 async def remove_event_guest(guest_id: str):
     await delete_event_guest(guest_id)
     return {"success": True}
-
-# ── HELPERS ───────────────────────────────────────────────────────────────────
-
-def _build_profile_text(contact: ContactPayload) -> str:
-    parts = [
-        f"Name: {contact.full_name}",
-        f"Role: {contact.title_role}" if contact.title_role else "",
-        f"Organization: {contact.organization}" if contact.organization else "",
-        f"Venture context: {contact.venture}" if contact.venture else "",
-        f"How we met: {contact.how_we_met}" if contact.how_we_met else "",
-        f"What they're building: {contact.what_building}" if contact.what_building else "",
-        f"What they need: {contact.what_need}" if contact.what_need else "",
-        f"What they offer: {contact.what_offer}" if contact.what_offer else "",
-        f"Met at: {contact.source}" if contact.source else "",
-        f"Notes: {contact.notes}" if contact.notes else "",
-    ]
-    return " | ".join(p for p in parts if p)
-
-def _build_content_text(content: ContentPayload) -> str:
-    parts = [
-        f"Content: {content.content_name}",
-        f"Type: {content.content_type}" if content.content_type else "",
-        f"Venture: {content.venture}" if content.venture else "",
-        f"Initiatives: {content.initiative_tags}" if content.initiative_tags else "",
-        f"Purpose: {content.activation_angle}" if content.activation_angle else "",
-        f"Notes: {content.notes}" if content.notes else "",
-    ]
-    return " | ".join(p for p in parts if p)
-
-def _build_follow_up_text(follow_up: FollowUpPayload) -> str:
-    parts = [
-        f"Follow-up with: {follow_up.contact_name}",
-        f"Meeting: {follow_up.meeting_name}" if follow_up.meeting_name else "",
-        f"Action needed: {follow_up.next_action}" if follow_up.next_action else "",
-        f"Venture: {follow_up.venture}" if follow_up.venture else "",
-        f"Notes: {follow_up.notes}" if follow_up.notes else "",
-    ]
-    return " | ".join(p for p in parts if p)
