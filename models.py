@@ -3,23 +3,23 @@ Pydantic request/response models for all entities.
 Contacts model lives in main.py — kept separate for legacy reasons.
 """
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, List
 
 
 # ── ORGANIZATIONS ─────────────────────────────────────────────────────────────
 
 class OrganizationPayload(BaseModel):
-    org_id: Optional[str] = None              # auto-generated if omitted: ORG-{timestamp}
-    name: str                                 # Canonical org name e.g. "gener8tor"
-    org_type: Optional[str] = ""             # Accelerator / VC / Incubator / Nonprofit / Venture Studio / Foundation / etc.
-    org_focus: Optional[str] = ""            # Primary domain in 5-10 words
-    description: Optional[str] = ""          # 2-3 sentences describing what they do
+    org_id: Optional[str] = None
+    name: str
+    org_type: Optional[str] = ""
+    org_focus: Optional[str] = ""
+    description: Optional[str] = ""
     website: Optional[str] = ""
     linkedin_url: Optional[str] = ""
-    location: Optional[str] = ""             # HQ city / state
-    recent_activity: Optional[str] = ""      # Latest notable program, cohort, announcement
-    conversation_hook: Optional[str] = ""    # Best thing to reference in outreach
-    last_enriched: Optional[str] = None      # ISO date string — when Claude last researched this org
+    location: Optional[str] = ""
+    recent_activity: Optional[str] = ""
+    conversation_hook: Optional[str] = ""
+    last_enriched: Optional[str] = None
     notes: Optional[str] = ""
 
 
@@ -197,3 +197,32 @@ class EventGuestUpdate(BaseModel):
     role: Optional[str] = None
     guest_status: Optional[str] = None
     notes: Optional[str] = None
+
+
+# ── CANDIDACY ─────────────────────────────────────────────────────────────────
+
+CANDIDACY_STATUSES = [
+    "Candidate - Not Yet Qualified",
+    "Candidate - Qualified",
+    "Candidate - Passed",
+    "Candidate - Contacted",
+    "Candidate - Responded",
+]
+
+class CandidacyUpdate(BaseModel):
+    outreach_candidacy: str  # must be one of CANDIDACY_STATUSES or empty string to clear
+
+
+# ── ON-DEMAND DRAFT ───────────────────────────────────────────────────────────
+
+class DraftOutreachPayload(BaseModel):
+    campaign_context: str
+    your_goal: Optional[str] = ""  # e.g. "I want to send her founders for the gener8tor programs"
+
+
+# ── INITIATIVE LINK (for multiselect from contact profile) ───────────────────
+
+class InitiativeLinkPayload(BaseModel):
+    initiative_ids: List[str]                    # list of initiative IDs to link
+    role: Optional[str] = "Warm Path"            # default stakeholder role
+    action_needed: Optional[str] = "None Yet"    # default action
