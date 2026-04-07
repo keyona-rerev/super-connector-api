@@ -5,6 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, List, Any, Dict
 import os
+import asyncio
 
 from db import (
     init_db,
@@ -41,6 +42,7 @@ from db import (
 from embedder import embed_profile, embed_query
 from matcher import find_matches, find_matches_by_vector
 from drafter import draft_intro
+from enricher import enrich_and_draft
 from models import (
     InitiativePayload, InitiativeStatusUpdate,
     SubProjectPayload,
@@ -120,6 +122,32 @@ class BucketPayload(BaseModel):
 
 class BucketMemberPayload(BaseModel):
     contact_id: str
+
+class BucketFromSearchPayload(BaseModel):
+    """
+    Conversational bucket creation.
+    Provide a natural language description of who you want in the bucket.
+    The API will run a semantic search, create the bucket, and populate it.
+    Returns the bucket + matched contacts for your review before committing.
+    """
+    description: str                          # e.g. "accelerator operators and program directors"
+    bucket_name: str                          # e.g. "Accelerator Operators"
+    bucket_color: Optional[str] = "#6BC47F"
+    initiative_id: Optional[str] = ""
+    top_k: Optional[int] = 20                # how many contacts to surface
+    auto_commit: Optional[bool] = False       # if True, creates bucket and adds all matches immediately
+                                              # if False (default), returns matches for human review
+
+class BucketEnrichPayload(BaseModel):
+    """
+    Triggers the enrichment + outreach drafting pipeline for all contacts in a bucket.
+    campaign_context: describe the angle of the outreach in plain English.
+    batch_size: how many contacts to process per call (to manage API rate limits / cost).
+    """
+    campaign_context: str
+    batch_size: Optional[int] = 5            # process N contacts per call; call again with offset for more
+    offset: Optional[int] = 0
+    write_back: Optional[bool] = True        # if True, writes enrichment back to contact notes in Railway
 
 # ── BRAIN DUMP MODELS ─────────────────────────────────────────────────────────
 class BrainDumpSubProject(BaseModel):
@@ -308,7 +336,7 @@ async def search_contacts(request: SearchRequest):
     For name/text lookups use GET /contacts/search?q= instead.
     """
     try:
-        vector = embed_query(request.query)   # FIXED: was embed_profile, now embed_query
+        vector = embed_query(request.query)
         results = await find_matches_by_vector(vector, limit=request.top_k)
         return {"query": request.query, "results": results}
     except Exception as e:
@@ -389,6 +417,168 @@ async def remove_member_from_bucket(bucket_id: str, contact_id: str):
 async def remove_bucket(bucket_id: str):
     await delete_bucket(bucket_id)
     return {"success": True}
+
+# ── NETWORK ACTIVATION: CONVERSATIONAL BUCKET CREATION ───────────────────────
+
+@app.post("/bucket/from-search", dependencies=[Depends(require_api_key)])
+async def create_bucket_from_search(payload: BucketFromSearchPayload):
+    """
+    Conversational bucket creation.
+
+    Give it a natural language description of who you want (e.g. 'accelerator operators
+    and program directors') and a name for the bucket. It will:
+    1. Run a semantic search against all contacts
+    2. Return the matches for human review (default)
+    3. If auto_commit=True, create the bucket and populate it immediately
+
+    Default behavior is review mode (auto_commit=False). Review the returned contacts,
+    then call POST /bucket to create the bucket and POST /bucket/{id}/members to add
+    contacts manually, or re-call with auto_commit=True to commit all matches at once.
+    """
+    try:
+        # Semantic search for matching contacts
+        vector = embed_query(payload.description)
+        matches = await find_matches_by_vector(vector, limit=payload.top_k)
+
+        if not payload.auto_commit:
+            # Review mode: return matches without creating anything
+            return {
+                "success": True,
+                "mode": "review",
+                "description": payload.description,
+                "proposed_bucket_name": payload.bucket_name,
+                "matches": matches,
+                "count": len(matches),
+                "next_step": "Review the matches above. To commit, re-call with auto_commit=true, "
+                             "or call POST /bucket then POST /bucket/{id}/members for each contact."
+            }
+
+        # Auto-commit mode: create bucket and populate
+        bucket_id = f"BKT-{int(time.time() * 1000)}"
+        bucket_data = {
+            "bucket_id": bucket_id,
+            "name": payload.bucket_name,
+            "description": payload.description,
+            "color": payload.bucket_color or "#6BC47F",
+            "initiative_id": payload.initiative_id or "",
+        }
+        await upsert_bucket(bucket_id, bucket_data)
+
+        added = []
+        for match in matches:
+            contact_id = match.get("contact_id")
+            if contact_id:
+                await add_contact_to_bucket(bucket_id, contact_id)
+                added.append(contact_id)
+
+        return {
+            "success": True,
+            "mode": "committed",
+            "bucket_id": bucket_id,
+            "bucket_name": payload.bucket_name,
+            "contacts_added": len(added),
+            "contacts": matches,
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── NETWORK ACTIVATION: ENRICHMENT + OUTREACH DRAFTING ───────────────────────
+
+@app.post("/bucket/{bucket_id}/enrich", dependencies=[Depends(require_api_key)])
+async def enrich_bucket(bucket_id: str, payload: BucketEnrichPayload):
+    """
+    Enrichment + personalized outreach drafting pipeline for a bucket.
+
+    For each contact in the bucket (in batches), this endpoint:
+    1. Pulls their profile from Railway
+    2. Runs Claude + web_search to research them and their organization
+    3. Drafts a personalized outreach email using the campaign_context you provide
+    4. Optionally writes the enrichment back to their contact notes in Railway
+
+    Use batch_size and offset to paginate through large buckets.
+    Each call processes batch_size contacts starting at offset.
+
+    Returns enriched profiles and email drafts ready for review and sending.
+    """
+    bucket = await get_bucket(bucket_id)
+    if not bucket:
+        raise HTTPException(status_code=404, detail="Bucket not found")
+
+    contacts = await get_contacts_in_bucket(bucket_id)
+    total = len(contacts)
+
+    # Apply pagination
+    batch = contacts[payload.offset: payload.offset + payload.batch_size]
+
+    if not batch:
+        return {
+            "success": True,
+            "bucket_id": bucket_id,
+            "total_in_bucket": total,
+            "batch_offset": payload.offset,
+            "batch_size": payload.batch_size,
+            "processed": 0,
+            "results": [],
+            "message": "No contacts in this batch. Offset may exceed bucket size."
+        }
+
+    results = []
+    for contact in batch:
+        # Run enrichment + draft (synchronous Claude calls, run in thread pool)
+        result = await asyncio.get_event_loop().run_in_executor(
+            None, enrich_and_draft, contact, payload.campaign_context
+        )
+        results.append(result)
+
+        # Write enrichment back to contact record in Railway if requested
+        if payload.write_back and result.get("enrichment", {}).get("enrichment_status") == "enriched":
+            try:
+                enrichment = result["enrichment"]
+                existing = await get_contact(contact["contact_id"])
+                if existing:
+                    # Append enrichment summary to notes, preserving existing notes
+                    enrich_note = (
+                        f"\n[Enriched {time.strftime('%Y-%m-%d')}] "
+                        f"Org: {enrichment.get('org_description', '')} "
+                        f"Person: {enrichment.get('person_summary', '')} "
+                        f"Recent: {enrichment.get('org_recent_activity', '')}"
+                    ).strip()
+                    existing_notes = existing.get("notes", "") or ""
+                    # Avoid duplicate enrichment blocks
+                    if "[Enriched" not in existing_notes:
+                        existing["notes"] = (existing_notes + enrich_note).strip()
+                    # Store org_type and org_focus in what_building if empty
+                    if not existing.get("what_building") and enrichment.get("org_description"):
+                        existing["what_building"] = enrichment["org_description"]
+                    # Re-vectorize with enriched data
+                    profile_text = " | ".join(filter(None, [
+                        f"Name: {existing.get('full_name', '')}",
+                        f"Role: {existing.get('title_role', '')}",
+                        f"Org: {existing.get('organization', '')}",
+                        f"What building: {existing.get('what_building', '')}",
+                        f"Notes: {existing.get('notes', '')}",
+                    ]))
+                    vector = embed_profile(profile_text)
+                    await store_contact(existing["contact_id"], existing, vector)
+            except Exception:
+                pass  # Write-back failure is non-fatal
+
+    has_more = (payload.offset + payload.batch_size) < total
+
+    return {
+        "success": True,
+        "bucket_id": bucket_id,
+        "bucket_name": bucket.get("name", ""),
+        "total_in_bucket": total,
+        "batch_offset": payload.offset,
+        "batch_size": payload.batch_size,
+        "processed": len(results),
+        "has_more": has_more,
+        "next_offset": payload.offset + payload.batch_size if has_more else None,
+        "results": results,
+    }
 
 # ════════════════════════════════════════════════════════════════════════════
 # INITIATIVES
