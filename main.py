@@ -35,7 +35,7 @@ from db import (
 from embedder import embed_profile, embed_query
 from matcher import find_matches, find_matches_by_vector
 from drafter import draft_intro
-from enricher import enrich_and_draft, enrich_org_pass
+from enricher import enrich_and_draft, enrich_org_pass, draft_outreach_email
 from models import (
     OrganizationPayload,
     InitiativePayload, InitiativeStatusUpdate,
@@ -47,6 +47,7 @@ from models import (
     FollowUpPayload, FollowUpStatusUpdate,
     EventPayload, EventStatusUpdate,
     EventGuestPayload, EventGuestUpdate,
+    CandidacyUpdate, DraftOutreachPayload, InitiativeLinkPayload, CANDIDACY_STATUSES,
 )
 
 app = FastAPI(title="Super Connector API")
@@ -79,11 +80,19 @@ class ContactPayload(BaseModel):
     full_name: str
     title_role: Optional[str] = ""
     organization: Optional[str] = ""
+    organization_id: Optional[str] = ""           # primary org Railway ID
+    organization_ids: Optional[List[str]] = []    # multi-org support
     how_we_met: Optional[str] = ""
     venture: Optional[str] = ""
+    # Legacy fields — kept for backward compat, not populated by enricher anymore
     what_building: Optional[str] = ""
     what_need: Optional[str] = ""
     what_offer: Optional[str] = ""
+    # New value exchange fields
+    what_i_can_offer: Optional[str] = ""          # what Keyona can bring to this person
+    what_they_offer_me: Optional[str] = ""        # what this person brings to Keyona's network
+    contact_type: Optional[str] = ""              # founder / investor / operator / academic / connector
+    outreach_candidacy: Optional[str] = ""        # one of CANDIDACY_STATUSES or empty
     relationship_health: Optional[str] = ""
     activation_potential: Optional[str] = ""
     source: Optional[str] = ""
@@ -175,15 +184,20 @@ class ContactNotePayload(BaseModel):
     source: Optional[str] = "manual"
     note_date: Optional[str] = None
 
-def _is_founder_role(role: str) -> bool:
-    if not role: return False
-    r = role.lower()
-    if any(s in r for s in ['founder','co-founder','ceo','cto','coo','creator','building','started']): return True
-    if any(s in r for s in ['program manager','program director','managing director','associate','vice president','vp','manager','director','coordinator','staff','analyst','officer','lead','partner','principal','fellow']): return False
-    return False
-
 def _build_profile_text(contact: ContactPayload) -> str:
-    parts = [f"Name: {contact.full_name}", f"Role: {contact.title_role}" if contact.title_role else "", f"Organization: {contact.organization}" if contact.organization else "", f"Venture context: {contact.venture}" if contact.venture else "", f"How we met: {contact.how_we_met}" if contact.how_we_met else "", f"What they're building: {contact.what_building}" if contact.what_building else "", f"What they need: {contact.what_need}" if contact.what_need else "", f"What they offer: {contact.what_offer}" if contact.what_offer else "", f"Met at: {contact.source}" if contact.source else "", f"Notes: {contact.notes}" if contact.notes else ""]
+    parts = [
+        f"Name: {contact.full_name}",
+        f"Role: {contact.title_role}" if contact.title_role else "",
+        f"Organization: {contact.organization}" if contact.organization else "",
+        f"Venture context: {contact.venture}" if contact.venture else "",
+        f"How we met: {contact.how_we_met}" if contact.how_we_met else "",
+        f"What they're building: {contact.what_building}" if contact.what_building else "",
+        f"What they need: {contact.what_need}" if contact.what_need else "",
+        f"What I can offer them: {contact.what_i_can_offer}" if contact.what_i_can_offer else "",
+        f"What they offer me: {contact.what_they_offer_me}" if contact.what_they_offer_me else "",
+        f"Met at: {contact.source}" if contact.source else "",
+        f"Notes: {contact.notes}" if contact.notes else "",
+    ]
     return " | ".join(p for p in parts if p)
 
 def _build_content_text(content: ContentPayload) -> str:
@@ -383,6 +397,83 @@ async def draft_intro_email(payload: DraftPayload):
     if not contact_a or not contact_b: raise HTTPException(status_code=404, detail="One or both contacts not found")
     return {"success": True, "draft": draft_intro(contact_a, contact_b)}
 
+# ── CANDIDACY ─────────────────────────────────────────────────────────────────
+
+@app.patch("/contact/{contact_id}/candidacy", dependencies=[Depends(require_api_key)])
+async def update_candidacy(contact_id: str, payload: CandidacyUpdate):
+    """Set or clear outreach candidacy status on a contact."""
+    if payload.outreach_candidacy and payload.outreach_candidacy not in CANDIDACY_STATUSES:
+        raise HTTPException(status_code=400, detail=f"Invalid status. Must be one of: {', '.join(CANDIDACY_STATUSES)}")
+    contact = await get_contact(contact_id)
+    if not contact: raise HTTPException(status_code=404, detail="Contact not found")
+    contact["outreach_candidacy"] = payload.outreach_candidacy
+    profile_text = " | ".join(filter(None, [
+        f"Name: {contact.get('full_name', '')}",
+        f"Role: {contact.get('title_role', '')}",
+        f"Org: {contact.get('organization', '')}",
+        f"What I can offer: {contact.get('what_i_can_offer', '')}",
+        f"What they offer: {contact.get('what_they_offer_me', '')}",
+        f"Notes: {contact.get('notes', '')}",
+    ]))
+    await store_contact(contact_id, contact, embed_profile(profile_text))
+    return {"success": True, "contact_id": contact_id, "outreach_candidacy": payload.outreach_candidacy}
+
+# ── ON-DEMAND DRAFT ───────────────────────────────────────────────────────────
+
+@app.post("/contact/{contact_id}/draft-outreach", dependencies=[Depends(require_api_key)])
+async def generate_outreach_draft(contact_id: str, payload: DraftOutreachPayload):
+    """Generate an on-demand outreach email draft using enriched contact data."""
+    contact = await get_contact(contact_id)
+    if not contact: raise HTTPException(status_code=404, detail="Contact not found")
+    loop = asyncio.get_event_loop()
+    draft = await loop.run_in_executor(
+        None, draft_outreach_email, contact, payload.campaign_context, payload.your_goal or ""
+    )
+    return {"success": True, "contact_id": contact_id, "draft": draft}
+
+# ── INITIATIVE MULTILINK ──────────────────────────────────────────────────────
+
+@app.post("/contact/{contact_id}/link-initiatives", dependencies=[Depends(require_api_key)])
+async def link_contact_to_initiatives(contact_id: str, payload: InitiativeLinkPayload):
+    """
+    Link a contact to one or more initiatives as a stakeholder.
+    Creates a STK record per initiative with default role=Warm Path, action=None Yet.
+    Skips any initiative the contact is already linked to.
+    """
+    contact = await get_contact(contact_id)
+    if not contact: raise HTTPException(status_code=404, detail="Contact not found")
+    full_name = contact.get("full_name", "")
+    existing_links = await get_stakeholders_for_contact(contact_id)
+    existing_ini_ids = {l.get("initiative_id") for l in existing_links}
+
+    created = []
+    skipped = []
+    for ini_id in payload.initiative_ids:
+        if ini_id in existing_ini_ids:
+            skipped.append(ini_id)
+            continue
+        stakeholder_id = f"STK-{int(time.time() * 1000)}"
+        stk_data = {
+            "stakeholder_id": stakeholder_id,
+            "contact_id": contact_id,
+            "full_name": full_name,
+            "initiative_id": ini_id,
+            "sub_project_id": "",
+            "role": payload.role or "Warm Path",
+            "action_needed": payload.action_needed or "None Yet",
+            "engagement_status": "Not Contacted",
+            "notes": "",
+        }
+        await upsert_stakeholder(stakeholder_id, contact_id, ini_id, stk_data)
+        created.append(ini_id)
+
+    return {
+        "success": True,
+        "contact_id": contact_id,
+        "linked": created,
+        "skipped_already_linked": skipped,
+    }
+
 # ════════════════════════════════════════════════════════════════════════════
 # BUCKETS
 # ════════════════════════════════════════════════════════════════════════════
@@ -471,18 +562,26 @@ async def enrich_bucket(bucket_id: str, payload: BucketEnrichPayload):
     loop = asyncio.get_event_loop()
     org_cache = await loop.run_in_executor(None, enrich_org_pass, batch)
 
-    # ── PASS 2: Individual contact enrichment + draft (sequential, one at a time) ──
+    # ── PASS 2: Individual contact enrichment (no draft), sequential ──────
     results = []
     for i, contact in enumerate(batch):
         result = await loop.run_in_executor(None, enrich_and_draft, contact, payload.campaign_context, org_cache)
         results.append(result)
 
-        # Write enriched data back to Railway contact record
         if payload.write_back and result.get("enrichment", {}).get("enrichment_status") == "enriched":
             try:
                 enrichment = result["enrichment"]
                 existing = await get_contact(contact["contact_id"])
                 if existing:
+                    # Write new value exchange fields
+                    if enrichment.get("what_i_can_offer"):
+                        existing["what_i_can_offer"] = enrichment["what_i_can_offer"]
+                    if enrichment.get("what_they_offer_me"):
+                        existing["what_they_offer_me"] = enrichment["what_they_offer_me"]
+                    if enrichment.get("contact_type"):
+                        existing["contact_type"] = enrichment["contact_type"]
+
+                    # Append enrichment summary to notes
                     org_ctx = enrichment.get("org_description", "")
                     person_ctx = enrichment.get("person_summary", "")
                     recent = enrichment.get("org_recent_activity", "")
@@ -495,26 +594,19 @@ async def enrich_bucket(bucket_id: str, payload: BucketEnrichPayload):
                         existing_notes = existing.get("notes", "") or ""
                         if "[Enriched" not in existing_notes:
                             existing["notes"] = (existing_notes + enrich_note).strip()
-                    role = existing.get("title_role", "") or ""
-                    if not existing.get("what_building") and org_ctx and _is_founder_role(role):
-                        existing["what_building"] = org_ctx
-                    elif not existing.get("what_offer") and org_ctx and not _is_founder_role(role):
-                        existing["what_offer"] = (
-                            f"Network access through {existing.get('organization', 'their org')} "
-                            f"({enrichment.get('org_type', 'organization')}). {org_ctx}"
-                        )
+
                     profile_text = " | ".join(filter(None, [
                         f"Name: {existing.get('full_name', '')}",
                         f"Role: {existing.get('title_role', '')}",
                         f"Org: {existing.get('organization', '')}",
-                        f"What they offer: {existing.get('what_offer', '')}",
+                        f"What I can offer: {existing.get('what_i_can_offer', '')}",
+                        f"What they offer me: {existing.get('what_they_offer_me', '')}",
                         f"Notes: {existing.get('notes', '')}",
                     ]))
                     await store_contact(existing["contact_id"], existing, embed_profile(profile_text))
             except Exception:
                 pass
 
-        # Sleep between contacts (except after the last one) to stay under rate limits
         if i < len(batch) - 1:
             await asyncio.sleep(15)
 
