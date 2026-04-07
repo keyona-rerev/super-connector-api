@@ -30,7 +30,6 @@ async def init_db():
             ON contacts USING ivfflat (embedding vector_cosine_ops)
             WITH (lists = 100);
         """)
-        # GIN index for fast full-text search across the whole profile JSONB
         await conn.execute("""
             CREATE INDEX IF NOT EXISTS contacts_profile_gin_idx
             ON contacts USING gin (profile);
@@ -175,7 +174,6 @@ async def init_db():
             ON event_guests (contact_id);
         """)
 
-        # Buckets — optionally linked to an initiative
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS buckets (
                 bucket_id TEXT PRIMARY KEY,
@@ -204,6 +202,29 @@ async def init_db():
         await conn.execute("""
             CREATE INDEX IF NOT EXISTS contact_buckets_bucket_idx
             ON contact_buckets (bucket_id);
+        """)
+
+        # ── ORGANIZATIONS ─────────────────────────────────────────────────────
+        # Shared org profiles — researched once, linked to many contacts.
+        # Contacts reference orgs via organization_id in their profile JSONB.
+        # org_name_lower index enables fast case-insensitive auto-linking.
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS organizations (
+                org_id TEXT PRIMARY KEY,
+                data JSONB NOT NULL,
+                embedding vector(512),
+                created_at TIMESTAMP DEFAULT NOW(),
+                updated_at TIMESTAMP DEFAULT NOW()
+            );
+        """)
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS organizations_name_lower_idx
+            ON organizations (LOWER(data->>'name'));
+        """)
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS organizations_embedding_idx
+            ON organizations USING ivfflat (embedding vector_cosine_ops)
+            WITH (lists = 10);
         """)
 
     finally:
@@ -257,11 +278,6 @@ async def count_contacts():
         await conn.close()
 
 async def text_search_contacts(query: str, limit: int = 50):
-    """
-    Simple text search across name, organization, title_role, notes, venture.
-    Uses ILIKE for case-insensitive substring matching — this is the 'type a name and find them' path.
-    Returns contacts where ANY of those fields contain the query string.
-    """
     conn = await _conn()
     try:
         q = f"%{query}%"
@@ -333,6 +349,188 @@ async def find_similar_by_vector(vector: list, limit: int = 10):
              **json.loads(r["profile"])}
             for r in rows
         ]
+    finally:
+        await conn.close()
+
+# ── ORGANIZATIONS ─────────────────────────────────────────────────────────────
+
+async def upsert_organization(org_id: str, data: dict, vector: list = None):
+    import numpy as np
+    conn = await _conn()
+    try:
+        if vector:
+            await conn.execute("""
+                INSERT INTO organizations (org_id, data, embedding, updated_at)
+                VALUES ($1, $2, $3, NOW())
+                ON CONFLICT (org_id)
+                DO UPDATE SET data = EXCLUDED.data, embedding = EXCLUDED.embedding, updated_at = NOW();
+            """, org_id, json.dumps(data), np.array(vector))
+        else:
+            await conn.execute("""
+                INSERT INTO organizations (org_id, data, updated_at)
+                VALUES ($1, $2, NOW())
+                ON CONFLICT (org_id)
+                DO UPDATE SET data = EXCLUDED.data, updated_at = NOW();
+            """, org_id, json.dumps(data))
+    finally:
+        await conn.close()
+
+async def get_organization(org_id: str):
+    conn = await _conn()
+    try:
+        row = await conn.fetchrow(
+            "SELECT org_id, data FROM organizations WHERE org_id = $1", org_id
+        )
+        if not row:
+            return None
+        return {"org_id": row["org_id"], **json.loads(row["data"])}
+    finally:
+        await conn.close()
+
+async def get_all_organizations():
+    conn = await _conn()
+    try:
+        rows = await conn.fetch(
+            "SELECT org_id, data FROM organizations ORDER BY updated_at DESC"
+        )
+        return [{"org_id": r["org_id"], **json.loads(r["data"])} for r in rows]
+    finally:
+        await conn.close()
+
+async def find_organization_by_name(name: str):
+    """Exact case-insensitive name match — used for auto-linking contacts."""
+    conn = await _conn()
+    try:
+        row = await conn.fetchrow(
+            "SELECT org_id, data FROM organizations WHERE LOWER(data->>'name') = LOWER($1)",
+            name
+        )
+        if not row:
+            return None
+        return {"org_id": row["org_id"], **json.loads(row["data"])}
+    finally:
+        await conn.close()
+
+async def find_organizations_by_name_fuzzy(name: str):
+    """
+    Fuzzy name search — returns all orgs whose name contains the query substring.
+    Used for conflict preview in auto-link flow.
+    """
+    conn = await _conn()
+    try:
+        rows = await conn.fetch(
+            "SELECT org_id, data FROM organizations WHERE LOWER(data->>'name') LIKE LOWER($1) ORDER BY updated_at DESC",
+            f"%{name}%"
+        )
+        return [{"org_id": r["org_id"], **json.loads(r["data"])} for r in rows]
+    finally:
+        await conn.close()
+
+async def get_contacts_for_org(org_id: str):
+    """Return all contacts whose profile has organization_id matching this org."""
+    conn = await _conn()
+    try:
+        rows = await conn.fetch(
+            "SELECT contact_id, profile FROM contacts WHERE profile->>'organization_id' = $1 ORDER BY updated_at DESC",
+            org_id
+        )
+        return [{"contact_id": r["contact_id"], **json.loads(r["profile"])} for r in rows]
+    finally:
+        await conn.close()
+
+async def preview_org_link(org_name: str):
+    """
+    Auto-link preview: find all contacts whose organization field matches org_name,
+    plus any existing orgs that could conflict (similar name).
+    Returns data for human review before committing.
+    """
+    conn = await _conn()
+    try:
+        # Contacts that would be linked
+        contact_rows = await conn.fetch("""
+            SELECT contact_id, profile FROM contacts
+            WHERE LOWER(profile->>'organization') = LOWER($1)
+            AND (profile->>'organization_id' IS NULL OR profile->>'organization_id' = '')
+            ORDER BY updated_at DESC
+        """, org_name)
+        matches = [{"contact_id": r["contact_id"], **json.loads(r["profile"])} for r in contact_rows]
+
+        # Already-linked contacts (have an org_id for this name)
+        linked_rows = await conn.fetch("""
+            SELECT o.org_id, o.data as org_data, COUNT(c.contact_id) as contact_count
+            FROM organizations o
+            LEFT JOIN contacts c ON c.profile->>'organization_id' = o.org_id
+            WHERE LOWER(o.data->>'name') LIKE LOWER($1)
+            GROUP BY o.org_id, o.data
+        """, f"%{org_name}%")
+        existing_orgs = [
+            {"org_id": r["org_id"], "contact_count": r["contact_count"],
+             **json.loads(r["org_data"])}
+            for r in linked_rows
+        ]
+
+        return {
+            "org_name": org_name,
+            "contacts_to_link": matches,
+            "contacts_to_link_count": len(matches),
+            "existing_orgs": existing_orgs,
+            "has_conflicts": len(existing_orgs) > 0,
+        }
+    finally:
+        await conn.close()
+
+async def commit_org_link(org_id: str, org_name: str):
+    """
+    Link all contacts whose organization field matches org_name to the given org_id.
+    Writes organization_id into their profile JSONB.
+    Returns count of contacts updated.
+    """
+    import numpy as np
+    conn = await _conn()
+    try:
+        rows = await conn.fetch("""
+            SELECT contact_id, profile, embedding FROM contacts
+            WHERE LOWER(profile->>'organization') = LOWER($1)
+            AND (profile->>'organization_id' IS NULL OR profile->>'organization_id' = '')
+        """, org_name)
+
+        updated = 0
+        for row in rows:
+            profile = json.loads(row["profile"])
+            profile["organization_id"] = org_id
+            embedding = row["embedding"]
+            if embedding is not None:
+                await conn.execute("""
+                    UPDATE contacts SET profile = $1, updated_at = NOW()
+                    WHERE contact_id = $2
+                """, json.dumps(profile), row["contact_id"])
+            else:
+                await conn.execute("""
+                    UPDATE contacts SET profile = $1, updated_at = NOW()
+                    WHERE contact_id = $2
+                """, json.dumps(profile), row["contact_id"])
+            updated += 1
+
+        return updated
+    finally:
+        await conn.close()
+
+async def delete_organization(org_id: str):
+    """Delete org and unlink all contacts (set their organization_id to null)."""
+    conn = await _conn()
+    try:
+        # Unlink contacts
+        rows = await conn.fetch(
+            "SELECT contact_id, profile FROM contacts WHERE profile->>'organization_id' = $1", org_id
+        )
+        for row in rows:
+            profile = json.loads(row["profile"])
+            profile.pop("organization_id", None)
+            await conn.execute(
+                "UPDATE contacts SET profile = $1, updated_at = NOW() WHERE contact_id = $2",
+                json.dumps(profile), row["contact_id"]
+            )
+        await conn.execute("DELETE FROM organizations WHERE org_id = $1", org_id)
     finally:
         await conn.close()
 
