@@ -35,7 +35,7 @@ from db import (
 from embedder import embed_profile, embed_query
 from matcher import find_matches, find_matches_by_vector
 from drafter import draft_intro
-from enricher import enrich_and_draft
+from enricher import enrich_and_draft, enrich_org_pass
 from models import (
     OrganizationPayload,
     InitiativePayload, InitiativeStatusUpdate,
@@ -236,8 +236,7 @@ async def get_org_by_id(org_id: str):
 
 @app.post("/organization", dependencies=[Depends(require_api_key)])
 async def create_organization(payload: OrganizationPayload):
-    org_id = payload.org_id or f"ORG-{int(time.time() * 1000)}"
-    data = payload.dict(); data["org_id"] = org_id
+    org_id = payload.org_id or f"ORG-{int(time.time() * 1000)}"; data = payload.dict(); data["org_id"] = org_id
     org_text = " | ".join(filter(None, [f"Org: {payload.name}", f"Type: {payload.org_type}" if payload.org_type else "", f"Focus: {payload.org_focus}" if payload.org_focus else "", f"Description: {payload.description}" if payload.description else ""]))
     vector = embed_profile(org_text) if org_text.strip() else None
     await upsert_organization(org_id, data, vector)
@@ -262,8 +261,8 @@ async def research_organization(org_id: str):
     if not existing: raise HTTPException(status_code=404, detail="Organization not found")
     org_name = existing.get("name", "")
     if not org_name: raise HTTPException(status_code=400, detail="Organization has no name to research")
-    from enricher import research_contact
-    enrichment = research_contact({"full_name": f"Someone at {org_name}", "organization": org_name, "title_role": ""})
+    from enricher import research_org
+    enrichment = research_org(org_name)
     if enrichment.get("enrichment_status") == "enriched":
         existing["org_type"] = enrichment.get("org_type") or existing.get("org_type", "")
         existing["org_focus"] = enrichment.get("org_focus") or existing.get("org_focus", "")
@@ -456,19 +455,37 @@ async def create_bucket_from_search(payload: BucketFromSearchPayload):
 async def enrich_bucket(bucket_id: str, payload: BucketEnrichPayload):
     bucket = await get_bucket(bucket_id)
     if not bucket: raise HTTPException(status_code=404, detail="Bucket not found")
-    contacts = await get_contacts_in_bucket(bucket_id); total = len(contacts)
-    batch = contacts[payload.offset: payload.offset + payload.batch_size]
+
+    all_contacts = await get_contacts_in_bucket(bucket_id)
+    total = len(all_contacts)
+    batch = all_contacts[payload.offset: payload.offset + payload.batch_size]
+
     if not batch:
-        return {"success": True, "bucket_id": bucket_id, "total_in_bucket": total, "batch_offset": payload.offset, "batch_size": payload.batch_size, "processed": 0, "results": [], "message": "No contacts in this batch."}
+        return {
+            "success": True, "bucket_id": bucket_id, "total_in_bucket": total,
+            "batch_offset": payload.offset, "batch_size": payload.batch_size,
+            "processed": 0, "results": [], "message": "No contacts in this batch."
+        }
+
+    # ── PASS 1: Org research (deduplicated, Haiku, sequential with sleep) ──
+    loop = asyncio.get_event_loop()
+    org_cache = await loop.run_in_executor(None, enrich_org_pass, batch)
+
+    # ── PASS 2: Individual contact enrichment + draft (sequential, one at a time) ──
     results = []
-    for contact in batch:
-        result = await asyncio.get_event_loop().run_in_executor(None, enrich_and_draft, contact, payload.campaign_context)
+    for i, contact in enumerate(batch):
+        result = await loop.run_in_executor(None, enrich_and_draft, contact, payload.campaign_context, org_cache)
         results.append(result)
+
+        # Write enriched data back to Railway contact record
         if payload.write_back and result.get("enrichment", {}).get("enrichment_status") == "enriched":
             try:
-                enrichment = result["enrichment"]; existing = await get_contact(contact["contact_id"])
+                enrichment = result["enrichment"]
+                existing = await get_contact(contact["contact_id"])
                 if existing:
-                    org_ctx = enrichment.get("org_description", ""); person_ctx = enrichment.get("person_summary", ""); recent = enrichment.get("org_recent_activity", "")
+                    org_ctx = enrichment.get("org_description", "")
+                    person_ctx = enrichment.get("person_summary", "")
+                    recent = enrichment.get("org_recent_activity", "")
                     parts = []
                     if org_ctx: parts.append(f"Org: {org_ctx}")
                     if person_ctx: parts.append(f"Person: {person_ctx}")
@@ -476,16 +493,44 @@ async def enrich_bucket(bucket_id: str, payload: BucketEnrichPayload):
                     if parts:
                         enrich_note = f"\n[Enriched {time.strftime('%Y-%m-%d')}] " + " | ".join(parts)
                         existing_notes = existing.get("notes", "") or ""
-                        if "[Enriched" not in existing_notes: existing["notes"] = (existing_notes + enrich_note).strip()
+                        if "[Enriched" not in existing_notes:
+                            existing["notes"] = (existing_notes + enrich_note).strip()
                     role = existing.get("title_role", "") or ""
-                    if not existing.get("what_building") and org_ctx and _is_founder_role(role): existing["what_building"] = org_ctx
+                    if not existing.get("what_building") and org_ctx and _is_founder_role(role):
+                        existing["what_building"] = org_ctx
                     elif not existing.get("what_offer") and org_ctx and not _is_founder_role(role):
-                        existing["what_offer"] = f"Network access through {existing.get('organization', 'their org')} ({enrichment.get('org_type', 'organization')}). {org_ctx}"
-                    profile_text = " | ".join(filter(None, [f"Name: {existing.get('full_name', '')}", f"Role: {existing.get('title_role', '')}", f"Org: {existing.get('organization', '')}", f"What they offer: {existing.get('what_offer', '')}", f"Notes: {existing.get('notes', '')}"]))
+                        existing["what_offer"] = (
+                            f"Network access through {existing.get('organization', 'their org')} "
+                            f"({enrichment.get('org_type', 'organization')}). {org_ctx}"
+                        )
+                    profile_text = " | ".join(filter(None, [
+                        f"Name: {existing.get('full_name', '')}",
+                        f"Role: {existing.get('title_role', '')}",
+                        f"Org: {existing.get('organization', '')}",
+                        f"What they offer: {existing.get('what_offer', '')}",
+                        f"Notes: {existing.get('notes', '')}",
+                    ]))
                     await store_contact(existing["contact_id"], existing, embed_profile(profile_text))
-            except Exception: pass
+            except Exception:
+                pass
+
+        # Sleep between contacts (except after the last one) to stay under rate limits
+        if i < len(batch) - 1:
+            await asyncio.sleep(15)
+
     has_more = (payload.offset + payload.batch_size) < total
-    return {"success": True, "bucket_id": bucket_id, "bucket_name": bucket.get("name", ""), "total_in_bucket": total, "batch_offset": payload.offset, "batch_size": payload.batch_size, "processed": len(results), "has_more": has_more, "next_offset": payload.offset + payload.batch_size if has_more else None, "results": results}
+    return {
+        "success": True,
+        "bucket_id": bucket_id,
+        "bucket_name": bucket.get("name", ""),
+        "total_in_bucket": total,
+        "batch_offset": payload.offset,
+        "batch_size": payload.batch_size,
+        "processed": len(results),
+        "has_more": has_more,
+        "next_offset": payload.offset + payload.batch_size if has_more else None,
+        "results": results,
+    }
 
 # ════════════════════════════════════════════════════════════════════════════
 # INITIATIVES / SUB-PROJECTS / STAKEHOLDERS
