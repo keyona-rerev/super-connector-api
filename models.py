@@ -6,24 +6,41 @@ from pydantic import BaseModel
 from typing import Optional
 
 
+# ── ORGANIZATIONS ─────────────────────────────────────────────────────────────
+
+class OrganizationPayload(BaseModel):
+    org_id: Optional[str] = None              # auto-generated if omitted: ORG-{timestamp}
+    name: str                                 # Canonical org name e.g. "gener8tor"
+    org_type: Optional[str] = ""             # Accelerator / VC / Incubator / Nonprofit / Venture Studio / Foundation / etc.
+    org_focus: Optional[str] = ""            # Primary domain in 5-10 words
+    description: Optional[str] = ""          # 2-3 sentences describing what they do
+    website: Optional[str] = ""
+    linkedin_url: Optional[str] = ""
+    location: Optional[str] = ""             # HQ city / state
+    recent_activity: Optional[str] = ""      # Latest notable program, cohort, announcement
+    conversation_hook: Optional[str] = ""    # Best thing to reference in outreach
+    last_enriched: Optional[str] = None      # ISO date string — when Claude last researched this org
+    notes: Optional[str] = ""
+
+
 # ── INITIATIVES ───────────────────────────────────────────────────────────────
 
 class InitiativePayload(BaseModel):
-    initiative_id: Optional[str] = None          # auto-generated if omitted
+    initiative_id: Optional[str] = None
     initiative_name: str
-    venture: Optional[str] = ""                  # ReRev / Prismm / BTC / Personal / Sekhmetic
+    venture: Optional[str] = ""
     goal: Optional[str] = ""
     core_question: Optional[str] = ""
-    status: Optional[str] = "Brain Dump"         # Brain Dump / Planning / Active / Paused / Complete
-    priority: Optional[str] = "Medium"           # Critical / High / Medium / Low / Parked
+    status: Optional[str] = "Brain Dump"
+    priority: Optional[str] = "Medium"
     timeline: Optional[str] = ""
     brand: Optional[str] = ""
     distribution: Optional[str] = ""
     format: Optional[str] = ""
     budget: Optional[str] = ""
     brain_dump: Optional[str] = ""
-    phoebe_cadence: Optional[str] = "Weekly"     # Daily / Every 2-3 days / Weekly / Biweekly / Monthly / None
-    last_phoebe_checkin: Optional[str] = None    # ISO date string
+    phoebe_cadence: Optional[str] = "Weekly"
+    last_phoebe_checkin: Optional[str] = None
     notes: Optional[str] = ""
 
 
@@ -38,7 +55,7 @@ class SubProjectPayload(BaseModel):
     initiative_id: str
     sub_project_name: str
     description: Optional[str] = ""
-    status: Optional[str] = "Not Started"        # Not Started / In Progress / Blocked / Complete
+    status: Optional[str] = "Not Started"
     priority: Optional[str] = "Medium"
     dependencies: Optional[str] = ""
     owner: Optional[str] = "Keyona"
@@ -49,14 +66,13 @@ class SubProjectPayload(BaseModel):
 
 class StakeholderPayload(BaseModel):
     stakeholder_id: Optional[str] = None
-    contact_id: Optional[str] = ""              # FK to contacts table — can be blank until linked
+    contact_id: Optional[str] = ""
     full_name: str
     initiative_id: str
     sub_project_id: Optional[str] = ""
-    role: Optional[str] = ""                    # Interview Subject / Advisor / Committee / Sponsor Prospect /
-                                                # Customer / Collaborator / Warm Path / Perspective Only
-    action_needed: Optional[str] = "None Yet"   # Outreach / Interview / Follow Up / Consider Perspective / None Yet
-    engagement_status: Optional[str] = "Not Contacted"  # Not Contacted / Contacted / Scheduled / Active / Complete / Declined
+    role: Optional[str] = ""
+    action_needed: Optional[str] = "None Yet"
+    engagement_status: Optional[str] = "Not Contacted"
     notes: Optional[str] = ""
 
 
@@ -71,9 +87,9 @@ class ActivationAnglePayload(BaseModel):
     angle_id: Optional[str] = None
     angle_name: str
     description: Optional[str] = ""
-    template: Optional[str] = ""               # The actual outreach script / framework
-    best_for: Optional[str] = ""               # What kinds of initiatives this works well for
-    used_in: Optional[str] = ""                # Comma-separated initiative IDs
+    template: Optional[str] = ""
+    best_for: Optional[str] = ""
+    used_in: Optional[str] = ""
     effectiveness_notes: Optional[str] = ""
 
 
@@ -81,17 +97,17 @@ class ActivationAnglePayload(BaseModel):
 
 class ActionItemPayload(BaseModel):
     action_id: Optional[str] = None
-    initiative_id: Optional[str] = ""          # "SPRINT" for standalone tasks
+    initiative_id: Optional[str] = ""
     sub_project_id: Optional[str] = ""
     stakeholder_id: Optional[str] = ""
-    action_type: Optional[str] = ""            # Research / Outreach / Content / Logistics / Follow Up / Decision
+    action_type: Optional[str] = ""
     description: str
-    status: Optional[str] = "Open"             # Open / In Progress / Waiting / Complete
+    status: Optional[str] = "Open"
     priority: Optional[str] = "Medium"
-    due_date: Optional[str] = None             # ISO date string
-    google_task_id: Optional[str] = ""         # For two-way Google Tasks sync
+    due_date: Optional[str] = None
+    google_task_id: Optional[str] = ""
     google_task_list: Optional[str] = ""
-    source: Optional[str] = "Manual"           # Manual / Brain Dump / Meeting Transcript / Phoebe
+    source: Optional[str] = "Manual"
     phoebe_tracking: Optional[bool] = False
     completed_date: Optional[str] = None
 
@@ -105,18 +121,16 @@ class ActionItemStatusUpdate(BaseModel):
 # ── CONTENT ───────────────────────────────────────────────────────────────────
 
 class ContentPayload(BaseModel):
-    content_id: Optional[str] = None           # auto-generated if omitted (e.g. C001)
+    content_id: Optional[str] = None
     content_name: str
-    content_type: Optional[str] = ""           # Article / Campaign Concept / Gifting Moment /
-                                               # Sequence Variant / Data Drop / Collab Hook /
-                                               # Case Study / Demo / Newsletter Issue / Event Recap
-    venture: Optional[str] = ""               # ReRev Labs / Prismm / Black Tech Capital / Sekhmetic
-    initiative_tags: Optional[str] = ""       # Comma-separated project IDs e.g. "P008, P017"
-    status: Optional[str] = "Idea"            # Idea / Draft / In Review / Active / Archived
-    activation_angle: Optional[str] = ""      # What this content is meant to do / who it's for
-    asset_link: Optional[str] = ""            # Google Doc, Notion, Drive link
-    approval_required: Optional[str] = "No"  # Yes / No
-    prismm_sync: Optional[str] = ""          # Pending / Synced / Needs Update / blank for non-Prismm
+    content_type: Optional[str] = ""
+    venture: Optional[str] = ""
+    initiative_tags: Optional[str] = ""
+    status: Optional[str] = "Idea"
+    activation_angle: Optional[str] = ""
+    asset_link: Optional[str] = ""
+    approval_required: Optional[str] = "No"
+    prismm_sync: Optional[str] = ""
     notes: Optional[str] = ""
 
 
@@ -128,18 +142,18 @@ class ContentStatusUpdate(BaseModel):
 # ── FOLLOW-UPS ────────────────────────────────────────────────────────────────
 
 class FollowUpPayload(BaseModel):
-    follow_up_id: Optional[str] = None        # auto-generated if omitted
+    follow_up_id: Optional[str] = None
     contact_name: str
-    contact_id: Optional[str] = ""            # FK to contacts table
-    meeting_name: Optional[str] = ""          # Which meeting triggered this follow-up
-    meeting_date: Optional[str] = None        # ISO date string
-    next_action: Optional[str] = ""           # What needs to happen e.g. "Send deck", "Intro to Martha"
-    next_action_date: Optional[str] = None    # ISO date string — when it should happen by
-    venture: Optional[str] = ""               # Which venture this follow-up is under
-    transcript_link: Optional[str] = ""       # Link to the meeting transcript Google Doc
-    draft_link: Optional[str] = ""            # Link to the Gmail draft if one was created
-    status: Optional[str] = "Open"            # Open / Done / Overdue / Cancelled
-    completed_date: Optional[str] = None      # ISO date string — when it was marked Done
+    contact_id: Optional[str] = ""
+    meeting_name: Optional[str] = ""
+    meeting_date: Optional[str] = None
+    next_action: Optional[str] = ""
+    next_action_date: Optional[str] = None
+    venture: Optional[str] = ""
+    transcript_link: Optional[str] = ""
+    draft_link: Optional[str] = ""
+    status: Optional[str] = "Open"
+    completed_date: Optional[str] = None
     notes: Optional[str] = ""
 
 
@@ -151,14 +165,14 @@ class FollowUpStatusUpdate(BaseModel):
 # ── EVENTS ────────────────────────────────────────────────────────────────────
 
 class EventPayload(BaseModel):
-    event_id: Optional[str] = None            # auto-generated if omitted: EVT-{timestamp}
+    event_id: Optional[str] = None
     event_name: str
-    event_type: Optional[str] = ""            # Hosting / Attending / Workshop
-    venture: Optional[str] = ""               # ReRev Labs / Prismm / BTC / Sekhmetic / etc.
-    date: Optional[str] = None                # ISO date string
+    event_type: Optional[str] = ""
+    venture: Optional[str] = ""
+    date: Optional[str] = None
     location: Optional[str] = ""
-    status: Optional[str] = "Planning"        # Planning / Confirmed / Complete / Cancelled
-    initiative_id: Optional[str] = ""         # FK to initiatives — nullable
+    status: Optional[str] = "Planning"
+    initiative_id: Optional[str] = ""
     description: Optional[str] = ""
     notes: Optional[str] = ""
 
@@ -170,12 +184,12 @@ class EventStatusUpdate(BaseModel):
 # ── EVENT GUESTS ──────────────────────────────────────────────────────────────
 
 class EventGuestPayload(BaseModel):
-    guest_id: Optional[str] = None            # auto-generated if omitted: EG-{timestamp}
-    event_id: str                             # FK to events — required
-    contact_id: Optional[str] = ""            # FK to contacts — nullable (can add before contact exists)
+    guest_id: Optional[str] = None
+    event_id: str
+    contact_id: Optional[str] = ""
     full_name: str
-    role: Optional[str] = ""                  # Speaker / Panelist / Attendee / Interviewee / Organizer / Sponsor
-    guest_status: Optional[str] = "Invited"   # Invited / Confirmed / Attended / No-show / Declined
+    role: Optional[str] = ""
+    guest_status: Optional[str] = "Invited"
     notes: Optional[str] = ""
 
 
