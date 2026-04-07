@@ -67,10 +67,7 @@ def build_verification_block(contact: dict, enrichment: dict) -> str:
         lines.append(f"About your org: {org_desc}")
     if person_summary:
         lines.append(f"About you: {person_summary}")
-    if how_we_met and "LinkedIn" not in how_we_met:
-        lines.append(f"How we connected: {how_we_met}")
-    elif how_we_met:
-        lines.append(f"How we connected: {how_we_met}")
+    lines.append(f"How we connected: {how_we_met}" if how_we_met else "How we connected: LinkedIn")
     lines.append("---")
 
     return "\n".join(lines)
@@ -82,7 +79,7 @@ def research_contact(contact: dict) -> dict:
     """
     Use Claude + web_search to gather public information about a contact.
     Focuses on the organization first, then any public profile on the person.
-    Returns a dict with enrichment fields.
+    Returns a dict with enrichment fields including a conversation_hook.
     """
     name = contact.get("full_name", "")
     org = contact.get("organization", "")
@@ -98,6 +95,7 @@ def research_contact(contact: dict) -> dict:
             "person_summary": "",
             "person_public_profile": "",
             "research_summary": "",
+            "conversation_hook": "",
             "enrichment_status": "skipped_no_data"
         }
 
@@ -175,7 +173,7 @@ def draft_outreach_email(contact: dict, enrichment: dict, campaign_context: str)
 
     What this email IS:
     - A warm, specific opening that references something real about their work
-    - A brief explanation of why Keyona is reaching out (her work as a connector, not a pitch)
+    - A brief note on why Keyona is reaching out (her work as a connector, not a pitch)
     - A structured verification block showing what she has on them
     - One clear ask: reply to correct anything that's off
 
@@ -183,9 +181,6 @@ def draft_outreach_email(contact: dict, enrichment: dict, campaign_context: str)
     - A pitch for Super Connector or any product
     - A generic cold email
     - Something that requires the recipient to do anything complex
-
-    Voice: Keyona's own voice. Warm, direct, no fluff, no em-dashes, no filler openers.
-    Format: Plain text only. Subject line first, then body.
     """
     name = contact.get("full_name", "")
     first_name = name.split()[0] if name else "there"
@@ -198,52 +193,47 @@ def draft_outreach_email(contact: dict, enrichment: dict, campaign_context: str)
     prompt = f"""You are writing an email for Keyona Meeks, a multi-venture founder and connector based in Birmingham, Alabama.
 
 Who Keyona is:
-- Founder of ReRev Labs (AI education and automation)
-- Co-founder of Prismm (digital vault for community banks)
-- Co-manages Black Tech Capital (climate tech VC)
+- Founder of ReRev Labs (AI education and automation consulting)
+- Co-founder of Prismm (digital vault for community banks and credit unions)
+- Co-manages Black Tech Capital (climate tech nano VC)
 - Runs the DO GOOD X accelerator
-- Regularly makes introductions between founders, investors, and operators in her network
+- Regularly makes introductions between founders, investors, and operators across her network
 
-What she is doing with this email:
+Why she is reaching out (the actual purpose, in plain terms):
 {campaign_context}
 
-Contact she is reaching:
+Contact she is writing to:
 - Name: {name}
 - Role: {role}
 - Organization: {org}
 
-Research gathered on this person:
+What Keyona knows about this person (from research):
 {research_summary}
 
-Specific hook to reference (something real and concrete about their work):
+The most specific, natural thing to reference about their work:
 {hook}
 
-Verification block to include verbatim in the email (do not modify this block):
+Verification block to include verbatim in the email (paste exactly, do not change anything):
 {verification_block}
 
-Write the email. Rules:
-1. Subject line first, then a blank line, then the body
-2. Open by referencing the hook specifically. One or two sentences. Make it clear you actually know something about their work.
-3. Briefly explain what you are working on that makes reaching out relevant. This should be about Keyona's work as a connector, not a product pitch. Keep it to 2-3 sentences.
-4. Transition into the verification block. Use a sentence like: "As I've been organizing my network, here's what I've captured about you and your work. If anything is off, just reply and let me know."
-5. Paste the verification block exactly as provided above, preserving all labels and line breaks.
-6. Close with one sentence. Keep it simple. No "looking forward to connecting" filler.
-7. Sign as: Keyona
+Write the email now. Follow these rules exactly:
 
-Hard rules:
-- No em-dashes anywhere
-- No "I hope this email finds you well" or any equivalent
-- No mention of "Super Connector" by name in the email
+1. SUBJECT LINE first, then blank line, then body.
+2. Open with 1-2 sentences that reference the hook specifically. Show you actually know something about their work. Do not be vague.
+3. 2-3 sentences explaining why you're reaching out in terms of your own work. This is about being a connector who is building her network intentionally, not about any product.
+4. One transition sentence into the verification block. Something like: "As I organize my network, here's what I have captured about you. Reply and let me know if anything is off."
+5. Paste the verification block exactly as written above, preserving every line and label.
+6. One closing sentence. Keep it natural and brief.
+7. Sign off as: Keyona
+
+Absolute rules:
+- No em-dashes anywhere in the email
+- No "I hope this email finds you well" or any equivalent opener
+- No mention of "Super Connector" by name
 - No exclamation points
-- Plain text only, no HTML, no bullet lists
-- First person throughout
-- Short paragraphs (2-3 sentences max each)
-- Total email body should be under 200 words excluding the verification block
-
-Format:
-SUBJECT: [subject line]
-
-[email body with verification block included]"""
+- Plain text only
+- Short paragraphs
+- Under 200 words total in the email body, not counting the verification block"""
 
     try:
         client = _get_client()
