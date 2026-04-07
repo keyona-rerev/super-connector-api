@@ -1,19 +1,27 @@
 """
 enricher.py — Network Activation Enrichment Engine
 
-Given a contact record, this module:
-1. Researches the contact and their org via Claude + web_search
-2. Drafts a plain-text outreach email from Keyona
-3. Returns enrichment data and the email draft
+Two-pass pipeline:
+  Pass 1 (org pass): research each unique organization once via Haiku + web_search,
+                     store results in Railway org table, return org cache dict keyed by org name
+  Pass 2 (contact pass): for each contact, read cached org data + research the person only,
+                          then draft the outreach email — all in a single Haiku call
 
 Called by POST /bucket/{bucket_id}/enrich in main.py.
 Replies processed by NetworkActivation.gs in the Phoebe GAS project.
+
+Model: claude-haiku-4-5-20251001 for all Claude calls (cost efficiency + rate limit management)
 """
 
 import os
 import json
 import re
+import time
 from typing import Optional
+
+
+HAIKU_MODEL = "claude-haiku-4-5-20251001"
+SLEEP_BETWEEN_CONTACTS = 15  # seconds between individual contact calls
 
 
 def _get_client():
@@ -32,11 +40,8 @@ def strip_citations(text: str) -> str:
     """
     if not text:
         return text
-    # Remove <cite index="...">...</cite> blocks (keep the inner text)
     text = re.sub(r'<cite[^>]*>(.*?)</cite>', r'\1', text, flags=re.DOTALL)
-    # Remove any remaining HTML/XML tags
     text = re.sub(r'<[^>]+>', '', text)
-    # Collapse multiple spaces/newlines
     text = re.sub(r'\n{3,}', '\n\n', text)
     text = re.sub(r' {2,}', ' ', text)
     return text.strip()
@@ -55,12 +60,23 @@ def clean_enrichment(enrichment: dict) -> dict:
     return cleaned
 
 
+def _parse_json_response(raw: str) -> dict:
+    """Strip markdown fences and parse JSON from a Claude response."""
+    clean = strip_citations(raw).strip()
+    if clean.startswith("```"):
+        parts = clean.split("```")
+        clean = parts[1] if len(parts) > 1 else clean
+        if clean.startswith("json"):
+            clean = clean[4:]
+    clean = clean.strip().rstrip("```").strip()
+    return json.loads(clean)
+
+
 # ── VERIFICATION BLOCK BUILDER ────────────────────────────────────────────────
 
 def build_verification_block(contact: dict, enrichment: dict) -> str:
     """
     Build the structured plain-text block that goes in the email.
-    Each field is prefixed with a label on its own line.
     The GAS reply parser looks for these exact prefixes to extract edits.
     """
     contact_id = contact.get("contact_id", "")
@@ -87,59 +103,184 @@ def build_verification_block(contact: dict, enrichment: dict) -> str:
     return "\n".join(lines)
 
 
-# ── RESEARCH ──────────────────────────────────────────────────────────────────
+# ── PASS 1: ORG RESEARCH ──────────────────────────────────────────────────────
 
-def research_contact(contact: dict) -> dict:
+def research_org(org_name: str, sample_role: str = "") -> dict:
     """
-    Use Claude + web_search to gather public information about a contact.
-    Returns a cleaned dict with no citation artifacts.
+    Research a single organization via Haiku + web_search.
+    Called once per unique org in Pass 1. Returns cleaned org data dict.
     """
-    name = contact.get("full_name", "")
-    org = contact.get("organization", "")
-    role = contact.get("title_role", "")
-    existing_notes = contact.get("notes", "") or ""
-    # Don't pass existing enrichment notes back into the prompt
-    if "[Enriched" in existing_notes:
-        existing_notes = existing_notes[:existing_notes.index("[Enriched")].strip()
-
-    if not org and not name:
+    if not org_name:
         return {
             "org_description": "", "org_type": "", "org_focus": "",
-            "org_recent_activity": "", "person_summary": "", "person_public_profile": "",
-            "research_summary": "", "conversation_hook": "", "enrichment_status": "skipped_no_data"
+            "org_recent_activity": "", "enrichment_status": "skipped_no_org"
         }
 
-    prompt = f"""You are a relationship intelligence researcher building outreach context.
+    prompt = f"""You are a relationship intelligence researcher.
 
-Contact:
-- Name: {name}
-- Organization: {org}
-- Role: {role}
-- Existing notes: {existing_notes[:300] if existing_notes else 'none'}
+Research this organization and return ONLY a valid JSON object. No markdown, no preamble, no citation tags.
 
-Search for this person and their organization. Focus on:
-1. What the organization does — mission, programs, who they serve
-2. Public information about this person — background, talks, notable work
-3. One specific recent thing (program launch, cohort, announcement) for a natural conversation hook
+Organization: {org_name}
+Context role: {sample_role}
 
-Return ONLY a valid JSON object with these exact keys. No markdown, no preamble, no citation tags:
+Return exactly:
 {{
-  "org_description": "2-3 sentences describing the organization",
-  "org_type": "Accelerator / VC / Incubator / Nonprofit / Venture Studio / Foundation / etc.",
+  "org_description": "2-3 sentences describing what this organization does, its mission, and who it serves",
+  "org_type": "Accelerator / VC / Incubator / Nonprofit / Venture Studio / Foundation / Corporate / University / Government / Other",
   "org_focus": "primary domain or mission in 5-10 words",
-  "org_recent_activity": "one specific recent thing, or empty string",
-  "person_summary": "what is publicly known about this person specifically",
-  "person_public_profile": "LinkedIn URL or relevant profile URL, else empty string",
-  "research_summary": "1 paragraph briefing combining org and person context",
-  "conversation_hook": "the single most concrete thing to reference in outreach",
+  "org_recent_activity": "one specific recent announcement, program launch, or cohort from the last 6 months — empty string if nothing found",
   "enrichment_status": "enriched"
 }}"""
 
     try:
         client = _get_client()
         response = client.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=1400,
+            model=HAIKU_MODEL,
+            max_tokens=600,
+            tools=[{"type": "web_search_20250305", "name": "web_search"}],
+            messages=[{"role": "user", "content": prompt}]
+        )
+        result_text = ""
+        for block in response.content:
+            if hasattr(block, "type") and block.type == "text":
+                result_text = block.text.strip()
+
+        org_data = _parse_json_response(result_text)
+        return clean_enrichment(org_data)
+
+    except Exception as e:
+        return {
+            "org_description": "", "org_type": "", "org_focus": "",
+            "org_recent_activity": "", "enrichment_status": f"error: {str(e)}"
+        }
+
+
+def enrich_org_pass(contacts: list) -> dict:
+    """
+    Pass 1: Deduplicate organizations across all contacts, research each once.
+    Returns org_cache dict keyed by lowercase org name.
+
+    Usage: org_cache = enrich_org_pass(contacts)
+    Then pass org_cache into enrich_and_draft() for each contact.
+    """
+    org_cache = {}
+    seen_orgs = {}
+
+    # Deduplicate: collect unique org names and a sample role for context
+    for contact in contacts:
+        org = (contact.get("organization") or "").strip()
+        role = (contact.get("title_role") or "").strip()
+        if org and org.lower() not in seen_orgs:
+            seen_orgs[org.lower()] = {"org_name": org, "sample_role": role}
+
+    total = len(seen_orgs)
+    for i, (org_key, org_info) in enumerate(seen_orgs.items()):
+        org_name = org_info["org_name"]
+        sample_role = org_info["sample_role"]
+
+        print(f"[Org Pass] {i+1}/{total}: researching {org_name}")
+        org_data = research_org(org_name, sample_role)
+        org_cache[org_key] = org_data
+
+        # Sleep between org calls to stay under rate limits (except after last one)
+        if i < total - 1:
+            time.sleep(SLEEP_BETWEEN_CONTACTS)
+
+    return org_cache
+
+
+# ── PASS 2: CONTACT RESEARCH + DRAFT (SINGLE COMBINED CALL) ──────────────────
+
+def enrich_and_draft(contact: dict, campaign_context: str, org_cache: dict = None) -> dict:
+    """
+    Pass 2: Research the individual contact + draft the outreach email in a single Haiku call.
+    Reads org context from org_cache if available — no repeat org research.
+
+    Args:
+        contact: contact dict from Railway
+        campaign_context: the outreach campaign context string
+        org_cache: dict keyed by lowercase org name, from enrich_org_pass()
+    """
+    name = contact.get("full_name", "") or ""
+    first_name = name.split()[0] if name else "there"
+    org = (contact.get("organization") or "").strip()
+    role = (contact.get("title_role") or "").strip()
+    how_we_met = contact.get("how_we_met", "") or "LinkedIn"
+    existing_notes = contact.get("notes", "") or ""
+    if "[Enriched" in existing_notes:
+        existing_notes = existing_notes[:existing_notes.index("[Enriched")].strip()
+
+    # Pull cached org data if available
+    org_data = {}
+    if org_cache and org.lower() in org_cache:
+        org_data = org_cache[org.lower()]
+
+    org_description = org_data.get("org_description", "")
+    org_type = org_data.get("org_type", "")
+    org_focus = org_data.get("org_focus", "")
+    org_recent_activity = org_data.get("org_recent_activity", "")
+
+    prompt = f"""You are a relationship intelligence assistant for Keyona Meeks, a multi-venture founder and connector based in Birmingham, Alabama.
+
+Keyona's background:
+- Founder of ReRev Labs (AI education and automation consulting)
+- Co-founder of Prismm (digital vault for community banks and credit unions)
+- Co-manages Black Tech Capital (climate tech nano VC)
+- Runs DO GOOD X accelerator
+- Regularly makes introductions between founders, investors, and operators
+
+Campaign context for this outreach:
+{campaign_context}
+
+Contact to research and write for:
+- Name: {name}
+- Role: {role}
+- Organization: {org}
+- How we met: {how_we_met}
+- Existing notes: {existing_notes[:200] if existing_notes else "none"}
+
+Organization context already researched (do not re-research the org):
+- Description: {org_description or "not available"}
+- Type: {org_type or "not available"}
+- Focus: {org_focus or "not available"}
+- Recent activity: {org_recent_activity or "not available"}
+
+Your tasks:
+1. Search the web for public information about {name} specifically (not the org — that's done)
+2. Using everything above, produce a single JSON object with these exact keys:
+
+{{
+  "org_description": "{org_description or 'use the org context above'}",
+  "org_type": "{org_type or ''}",
+  "org_focus": "{org_focus or ''}",
+  "org_recent_activity": "{org_recent_activity or ''}",
+  "person_summary": "what is publicly known about {name} — background, notable work, recent activity",
+  "person_public_profile": "LinkedIn URL or relevant profile URL, else empty string",
+  "research_summary": "1 paragraph combining org and person context for outreach use",
+  "conversation_hook": "the single most concrete and specific thing to reference in an opening line — prefer something about {name} personally or {org}'s recent activity",
+  "enrichment_status": "enriched",
+  "email_subject": "a plain-text email subject line, no exclamation points, referencing the hook or org",
+  "email_body": "the full email body only (no subject line here). Rules: plain text, no markdown, no em-dashes, no exclamation points, no 'I hope this finds you well', do not name the tool 'Super Connector', under 200 words, sign off as Keyona. Open with the hook. 2-3 sentences on being an intentional connector and why you're reaching out. One sentence transitioning to the verification block. Then paste this verification block exactly as written below. Then one brief closing sentence."
+}}
+
+Verification block to paste verbatim inside email_body after the transition sentence:
+---
+SC_CONTACT_ID: {contact.get("contact_id", "")}
+Name: {name}
+Role: {role}
+Organization: {org}
+About your org: {org_description or "[org description here]"}
+About you: [you will fill this from your person research]
+How we connected: {how_we_met or "LinkedIn"}
+---
+
+Return ONLY the JSON object. No markdown fences, no preamble, no citation tags."""
+
+    try:
+        client = _get_client()
+        response = client.messages.create(
+            model=HAIKU_MODEL,
+            max_tokens=1800,
             tools=[{"type": "web_search_20250305", "name": "web_search"}],
             messages=[{"role": "user", "content": prompt}]
         )
@@ -149,113 +290,50 @@ Return ONLY a valid JSON object with these exact keys. No markdown, no preamble,
             if hasattr(block, "type") and block.type == "text":
                 result_text = block.text.strip()
 
-        # Strip any citation artifacts from the raw text before JSON parsing
-        result_text = strip_citations(result_text)
+        parsed = _parse_json_response(result_text)
+        enrichment = clean_enrichment(parsed)
 
-        clean = result_text.strip()
-        if clean.startswith("```"):
-            clean = clean.split("```")[1]
-            if clean.startswith("json"):
-                clean = clean[4:]
-        clean = clean.strip().rstrip("```").strip()
+        # Build final verification block with actual person_summary filled in
+        final_enrichment = {
+            "org_description": enrichment.get("org_description", org_description),
+            "org_type": enrichment.get("org_type", org_type),
+            "org_focus": enrichment.get("org_focus", org_focus),
+            "org_recent_activity": enrichment.get("org_recent_activity", org_recent_activity),
+            "person_summary": enrichment.get("person_summary", ""),
+            "person_public_profile": enrichment.get("person_public_profile", ""),
+            "research_summary": enrichment.get("research_summary", ""),
+            "conversation_hook": enrichment.get("conversation_hook", ""),
+            "enrichment_status": enrichment.get("enrichment_status", "enriched"),
+        }
 
-        enrichment = json.loads(clean)
-        # Strip citations from all fields after parsing too
-        return clean_enrichment(enrichment)
+        verification_block = build_verification_block(contact, final_enrichment)
+
+        # Reconstruct email with proper verification block
+        email_subject = strip_citations(enrichment.get("email_subject", ""))
+        email_body = strip_citations(enrichment.get("email_body", ""))
+        email_draft = f"SUBJECT: {email_subject}\n\n{email_body}" if email_subject else email_body
+
+        return {
+            "contact_id": contact.get("contact_id", ""),
+            "full_name": name,
+            "organization": org,
+            "enrichment": final_enrichment,
+            "verification_block": verification_block,
+            "email_draft": email_draft,
+        }
 
     except Exception as e:
         return {
-            "org_description": "", "org_type": "", "org_focus": "",
-            "org_recent_activity": "", "person_summary": "", "person_public_profile": "",
-            "research_summary": "", "conversation_hook": "",
-            "enrichment_status": f"error: {str(e)}"
+            "contact_id": contact.get("contact_id", ""),
+            "full_name": name,
+            "organization": org,
+            "enrichment": {
+                "org_description": org_description, "org_type": org_type,
+                "org_focus": org_focus, "org_recent_activity": org_recent_activity,
+                "person_summary": "", "person_public_profile": "",
+                "research_summary": "", "conversation_hook": "",
+                "enrichment_status": f"error: {str(e)}"
+            },
+            "verification_block": build_verification_block(contact, org_data),
+            "email_draft": f"[Draft failed: {str(e)}]",
         }
-
-
-# ── EMAIL DRAFTING ────────────────────────────────────────────────────────────
-
-def draft_outreach_email(contact: dict, enrichment: dict, campaign_context: str) -> str:
-    """
-    Draft a plain-text outreach email from Keyona.
-    Uses cleaned enrichment data — no citation artifacts.
-    """
-    name = contact.get("full_name", "")
-    first_name = name.split()[0] if name else "there"
-    org = contact.get("organization", "") or ""
-    role = contact.get("title_role", "") or ""
-    hook = strip_citations(enrichment.get("conversation_hook", "") or "")
-    research_summary = strip_citations(enrichment.get("research_summary", "") or "")
-    verification_block = build_verification_block(contact, enrichment)
-
-    prompt = f"""You are writing an email for Keyona Meeks, a multi-venture founder and connector based in Birmingham, Alabama.
-
-Who Keyona is:
-- Founder of ReRev Labs (AI education and automation consulting)
-- Co-founder of Prismm (digital vault for community banks and credit unions)
-- Co-manages Black Tech Capital (climate tech nano VC)
-- Runs the DO GOOD X accelerator
-- Regularly makes introductions between founders, investors, and operators
-
-Why she is reaching out:
-{campaign_context}
-
-Contact:
-- Name: {name}
-- Role: {role}
-- Organization: {org}
-
-Research summary (clean text, use as context only):
-{research_summary}
-
-Best conversation hook:
-{hook}
-
-Verification block (paste verbatim, do not alter):
-{verification_block}
-
-Write the email:
-1. SUBJECT: line first, then blank line, then body
-2. Open with 1-2 sentences referencing the hook specifically
-3. 2-3 sentences on why you're reaching out — about being an intentional connector
-4. One sentence transitioning to the verification block
-5. Paste the verification block exactly
-6. One brief closing sentence
-7. Sign: Keyona
-
-Rules: no em-dashes, no exclamation points, no "I hope this finds you well", no mention of "Super Connector", plain text only, under 200 words not counting the verification block"""
-
-    try:
-        client = _get_client()
-        response = client.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=1000,
-            messages=[{"role": "user", "content": prompt}]
-        )
-        result = ""
-        for block in response.content:
-            if hasattr(block, "text"):
-                result = strip_citations(block.text.strip())
-        return result
-    except Exception as e:
-        return f"[Draft failed: {str(e)}]"
-
-
-# ── FULL PIPELINE ─────────────────────────────────────────────────────────────
-
-def enrich_and_draft(contact: dict, campaign_context: str) -> dict:
-    """
-    Full pipeline: research, clean, build verification block, draft email.
-    All output is guaranteed free of citation artifacts.
-    """
-    enrichment = research_contact(contact)  # already cleaned
-    verification_block = build_verification_block(contact, enrichment)
-    draft = draft_outreach_email(contact, enrichment, campaign_context)
-
-    return {
-        "contact_id": contact.get("contact_id", ""),
-        "full_name": contact.get("full_name", ""),
-        "organization": contact.get("organization", ""),
-        "enrichment": enrichment,
-        "verification_block": verification_block,
-        "email_draft": draft,
-    }
