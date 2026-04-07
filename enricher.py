@@ -7,13 +7,22 @@ Given a contact record and a campaign context, this module:
 3. Returns an enriched profile dict + a personalized outreach email draft
 
 Called by the /bucket/{bucket_id}/enrich endpoint in main.py.
+
+NOTE: Anthropic client is instantiated lazily inside each function call, not at module
+level. This prevents startup failures if ANTHROPIC_API_KEY is not set at boot time.
 """
 
 import os
-import anthropic
+import json
+import time
 from typing import Optional
 
-client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
+
+def _get_client():
+    """Lazily instantiate the Anthropic client to avoid startup failures."""
+    import anthropic
+    return anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
+
 
 # ── RESEARCH ──────────────────────────────────────────────────────────────────
 
@@ -29,7 +38,16 @@ def research_contact(contact: dict) -> dict:
     existing_notes = contact.get("notes", "")
 
     if not org and not name:
-        return {"research_summary": "", "org_description": "", "person_summary": "", "enrichment_status": "skipped_no_data"}
+        return {
+            "org_description": "",
+            "org_type": "",
+            "org_focus": "",
+            "org_recent_activity": "",
+            "person_summary": "",
+            "person_public_profile": "",
+            "research_summary": "",
+            "enrichment_status": "skipped_no_data"
+        }
 
     prompt = f"""You are a relationship intelligence researcher helping build a warm outreach profile.
 
@@ -59,6 +77,7 @@ Return your findings as a JSON object with these exact keys:
 Return only the JSON object. No markdown, no preamble."""
 
     try:
+        client = _get_client()
         response = client.messages.create(
             model="claude-sonnet-4-20250514",
             max_tokens=1200,
@@ -66,14 +85,13 @@ Return only the JSON object. No markdown, no preamble."""
             messages=[{"role": "user", "content": prompt}]
         )
 
-        # Extract the final text block from response
+        # Extract the final text block (Claude's answer after tool use)
         result_text = ""
         for block in response.content:
-            if block.type == "text":
+            if hasattr(block, "type") and block.type == "text":
                 result_text = block.text.strip()
 
         # Parse JSON from result
-        import json
         clean = result_text.strip().lstrip("```json").lstrip("```").rstrip("```").strip()
         enrichment = json.loads(clean)
         return enrichment
@@ -98,12 +116,6 @@ def draft_outreach_email(contact: dict, enrichment: dict, campaign_context: str)
     Draft a personalized outreach email for a contact using their enriched profile
     and the campaign context provided by Keyona.
 
-    The email:
-    - Introduces Keyona and the campaign angle
-    - References specific things about the person/org to show genuine familiarity
-    - Shows the information SC has about them and asks them to verify/correct
-    - Is warm, direct, not salesy
-
     Voice guidelines:
     - No em-dashes
     - First-person, conversational but professional
@@ -118,7 +130,6 @@ def draft_outreach_email(contact: dict, enrichment: dict, campaign_context: str)
     person_summary = enrichment.get("person_summary", "")
     research_summary = enrichment.get("research_summary", "")
 
-    # Build what SC currently knows about this person, for the verification block
     known_fields = []
     if name:
         known_fields.append(f"Name: {name}")
@@ -182,6 +193,7 @@ SUBJECT: [subject line]
 Return only the subject line and email body. No commentary."""
 
     try:
+        client = _get_client()
         response = client.messages.create(
             model="claude-sonnet-4-20250514",
             max_tokens=1000,
