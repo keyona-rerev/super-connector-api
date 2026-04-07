@@ -1,5 +1,5 @@
 import time
-from fastapi import FastAPI, HTTPException, Security, Depends
+from fastapi import FastAPI, HTTPException, Security, Depends, BackgroundTasks
 from fastapi.security.api_key import APIKeyHeader
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -75,24 +75,157 @@ def require_api_key(key: str = Security(api_key_header)):
 async def startup():
     await init_db()
 
+# ════════════════════════════════════════════════════════════════════════════
+# BACKGROUND JOB STATE (in-memory, single-process Railway)
+# ════════════════════════════════════════════════════════════════════════════
+
+# Haiku pricing as of 2025: $0.80/M input tokens, $4.00/M output tokens
+HAIKU_INPUT_COST_PER_TOKEN = 0.80 / 1_000_000
+HAIKU_OUTPUT_COST_PER_TOKEN = 4.00 / 1_000_000
+COST_WARNING_THRESHOLD = 5.00  # dollars
+
+_enrich_jobs: Dict[str, dict] = {}
+
+
+def _estimate_cost(input_tokens: int, output_tokens: int) -> float:
+    return (input_tokens * HAIKU_INPUT_COST_PER_TOKEN) + (output_tokens * HAIKU_OUTPUT_COST_PER_TOKEN)
+
+
+async def _run_enrich_all_job(job_id: str, bucket_id: str, campaign_context: str):
+    """
+    Background task: enrich every unenriched contact in a bucket one at a time.
+    Tracks estimated cost. Halts and flags if spend exceeds COST_WARNING_THRESHOLD.
+    Skips contacts that already have what_i_can_offer populated.
+    """
+    job = _enrich_jobs[job_id]
+    job["status"] = "running"
+
+    try:
+        all_contacts = await get_contacts_in_bucket(bucket_id)
+        to_enrich = [c for c in all_contacts if not (c.get("what_i_can_offer") or "").strip()]
+
+        job["total"] = len(all_contacts)
+        job["to_enrich"] = len(to_enrich)
+        job["processed"] = 0
+        job["skipped_already_done"] = len(all_contacts) - len(to_enrich)
+        job["succeeded"] = 0
+        job["failed"] = []
+        job["estimated_cost_usd"] = 0.0
+        job["cost_halted"] = False
+
+        loop = asyncio.get_event_loop()
+
+        for i, contact in enumerate(to_enrich):
+            # Check cost before each contact
+            if job["estimated_cost_usd"] >= COST_WARNING_THRESHOLD:
+                job["cost_halted"] = True
+                job["status"] = "halted_cost_limit"
+                job["message"] = (
+                    f"Halted after {job['succeeded']} contacts. "
+                    f"Estimated spend reached ${job['estimated_cost_usd']:.4f}, "
+                    f"which hit the ${COST_WARNING_THRESHOLD:.2f} warning threshold. "
+                    f"Call /bucket/{bucket_id}/enrich-status to review, then restart if needed."
+                )
+                return
+
+            contact_id = contact.get("contact_id", "")
+            name = contact.get("full_name", "Unknown")
+            job["current_contact"] = name
+
+            try:
+                # Org pass for just this one contact
+                org_cache = await loop.run_in_executor(None, enrich_org_pass, [contact])
+
+                # Contact enrichment pass
+                result = await loop.run_in_executor(
+                    None, enrich_and_draft, contact, campaign_context, org_cache
+                )
+
+                enrichment = result.get("enrichment", {})
+                status = enrichment.get("enrichment_status", "")
+
+                # Estimate tokens: org prompt ~800 in/200 out, contact prompt ~1200 in/400 out
+                job["estimated_cost_usd"] += _estimate_cost(2000, 600)
+
+                if status == "enriched":
+                    existing = await get_contact(contact_id)
+                    if existing:
+                        if enrichment.get("what_i_can_offer"):
+                            existing["what_i_can_offer"] = enrichment["what_i_can_offer"]
+                        if enrichment.get("what_they_offer_me"):
+                            existing["what_they_offer_me"] = enrichment["what_they_offer_me"]
+                        if enrichment.get("contact_type"):
+                            existing["contact_type"] = enrichment["contact_type"]
+
+                        org_ctx = enrichment.get("org_description", "")
+                        person_ctx = enrichment.get("person_summary", "")
+                        recent = enrichment.get("org_recent_activity", "")
+                        parts = []
+                        if org_ctx: parts.append(f"Org: {org_ctx}")
+                        if person_ctx: parts.append(f"Person: {person_ctx}")
+                        if recent: parts.append(f"Recent: {recent}")
+                        if parts:
+                            enrich_note = f"\n[Enriched {time.strftime('%Y-%m-%d')}] " + " | ".join(parts)
+                            existing_notes = existing.get("notes", "") or ""
+                            if "[Enriched" not in existing_notes:
+                                existing["notes"] = (existing_notes + enrich_note).strip()
+
+                        profile_text = " | ".join(filter(None, [
+                            f"Name: {existing.get('full_name', '')}",
+                            f"Role: {existing.get('title_role', '')}",
+                            f"Org: {existing.get('organization', '')}",
+                            f"What I can offer: {existing.get('what_i_can_offer', '')}",
+                            f"What they offer me: {existing.get('what_they_offer_me', '')}",
+                            f"Notes: {existing.get('notes', '')}",
+                        ]))
+                        await store_contact(contact_id, existing, embed_profile(profile_text))
+
+                    job["succeeded"] += 1
+                else:
+                    job["failed"].append({"id": contact_id, "name": name, "status": status})
+
+            except Exception as e:
+                job["failed"].append({"id": contact_id, "name": name, "error": str(e)})
+
+            job["processed"] += 1
+
+            # 3s pause between contacts — enough breathing room without being slow
+            if i < len(to_enrich) - 1:
+                await asyncio.sleep(3)
+
+        job["status"] = "complete"
+        job["current_contact"] = None
+        job["message"] = (
+            f"Done. {job['succeeded']} enriched, {len(job['failed'])} failed, "
+            f"{job['skipped_already_done']} already had data. "
+            f"Estimated cost: ${job['estimated_cost_usd']:.4f}"
+        )
+
+    except Exception as e:
+        job["status"] = "error"
+        job["message"] = str(e)
+
+
+class BucketEnrichAllPayload(BaseModel):
+    campaign_context: str
+
+
 class ContactPayload(BaseModel):
     contact_id: str
     full_name: str
     title_role: Optional[str] = ""
     organization: Optional[str] = ""
-    organization_id: Optional[str] = ""           # primary org Railway ID
-    organization_ids: Optional[List[str]] = []    # multi-org support
+    organization_id: Optional[str] = ""
+    organization_ids: Optional[List[str]] = []
     how_we_met: Optional[str] = ""
     venture: Optional[str] = ""
-    # Legacy fields — kept for backward compat, not populated by enricher anymore
     what_building: Optional[str] = ""
     what_need: Optional[str] = ""
     what_offer: Optional[str] = ""
-    # New value exchange fields
-    what_i_can_offer: Optional[str] = ""          # what Keyona can bring to this person
-    what_they_offer_me: Optional[str] = ""        # what this person brings to Keyona's network
-    contact_type: Optional[str] = ""              # founder / investor / operator / academic / connector
-    outreach_candidacy: Optional[str] = ""        # one of CANDIDACY_STATUSES or empty
+    what_i_can_offer: Optional[str] = ""
+    what_they_offer_me: Optional[str] = ""
+    contact_type: Optional[str] = ""
+    outreach_candidacy: Optional[str] = ""
     relationship_health: Optional[str] = ""
     activation_potential: Optional[str] = ""
     source: Optional[str] = ""
@@ -131,7 +264,7 @@ class BucketFromSearchPayload(BaseModel):
 
 class BucketEnrichPayload(BaseModel):
     campaign_context: str
-    batch_size: Optional[int] = 1  # Default to 1 for rate limit safety
+    batch_size: Optional[int] = 1
     offset: Optional[int] = 0
     write_back: Optional[bool] = True
 
@@ -401,7 +534,6 @@ async def draft_intro_email(payload: DraftPayload):
 
 @app.patch("/contact/{contact_id}/candidacy", dependencies=[Depends(require_api_key)])
 async def update_candidacy(contact_id: str, payload: CandidacyUpdate):
-    """Set or clear outreach candidacy status on a contact."""
     if payload.outreach_candidacy and payload.outreach_candidacy not in CANDIDACY_STATUSES:
         raise HTTPException(status_code=400, detail=f"Invalid status. Must be one of: {', '.join(CANDIDACY_STATUSES)}")
     contact = await get_contact(contact_id)
@@ -422,7 +554,6 @@ async def update_candidacy(contact_id: str, payload: CandidacyUpdate):
 
 @app.post("/contact/{contact_id}/draft-outreach", dependencies=[Depends(require_api_key)])
 async def generate_outreach_draft(contact_id: str, payload: DraftOutreachPayload):
-    """Generate an on-demand outreach email draft using enriched contact data."""
     contact = await get_contact(contact_id)
     if not contact: raise HTTPException(status_code=404, detail="Contact not found")
     loop = asyncio.get_event_loop()
@@ -435,17 +566,11 @@ async def generate_outreach_draft(contact_id: str, payload: DraftOutreachPayload
 
 @app.post("/contact/{contact_id}/link-initiatives", dependencies=[Depends(require_api_key)])
 async def link_contact_to_initiatives(contact_id: str, payload: InitiativeLinkPayload):
-    """
-    Link a contact to one or more initiatives as a stakeholder.
-    Creates a STK record per initiative with default role=Warm Path, action=None Yet.
-    Skips any initiative the contact is already linked to.
-    """
     contact = await get_contact(contact_id)
     if not contact: raise HTTPException(status_code=404, detail="Contact not found")
     full_name = contact.get("full_name", "")
     existing_links = await get_stakeholders_for_contact(contact_id)
     existing_ini_ids = {l.get("initiative_id") for l in existing_links}
-
     created = []
     skipped = []
     for ini_id in payload.initiative_ids:
@@ -466,13 +591,7 @@ async def link_contact_to_initiatives(contact_id: str, payload: InitiativeLinkPa
         }
         await upsert_stakeholder(stakeholder_id, contact_id, ini_id, stk_data)
         created.append(ini_id)
-
-    return {
-        "success": True,
-        "contact_id": contact_id,
-        "linked": created,
-        "skipped_already_linked": skipped,
-    }
+    return {"success": True, "contact_id": contact_id, "linked": created, "skipped_already_linked": skipped}
 
 # ════════════════════════════════════════════════════════════════════════════
 # BUCKETS
@@ -542,6 +661,8 @@ async def create_bucket_from_search(payload: BucketFromSearchPayload):
         return {"success": True, "mode": "committed", "bucket_id": bucket_id, "bucket_name": payload.bucket_name, "contacts_added": len(added), "contacts": matches}
     except Exception as e: raise HTTPException(status_code=500, detail=str(e))
 
+# ── LEGACY BATCH ENRICH (kept for backward compat) ────────────────────────────
+
 @app.post("/bucket/{bucket_id}/enrich", dependencies=[Depends(require_api_key)])
 async def enrich_bucket(bucket_id: str, payload: BucketEnrichPayload):
     bucket = await get_bucket(bucket_id)
@@ -558,11 +679,9 @@ async def enrich_bucket(bucket_id: str, payload: BucketEnrichPayload):
             "processed": 0, "results": [], "message": "No contacts in this batch."
         }
 
-    # ── PASS 1: Org research (deduplicated, Haiku, sequential with sleep) ──
     loop = asyncio.get_event_loop()
     org_cache = await loop.run_in_executor(None, enrich_org_pass, batch)
 
-    # ── PASS 2: Individual contact enrichment (no draft), sequential ──────
     results = []
     for i, contact in enumerate(batch):
         result = await loop.run_in_executor(None, enrich_and_draft, contact, payload.campaign_context, org_cache)
@@ -573,15 +692,12 @@ async def enrich_bucket(bucket_id: str, payload: BucketEnrichPayload):
                 enrichment = result["enrichment"]
                 existing = await get_contact(contact["contact_id"])
                 if existing:
-                    # Write new value exchange fields
                     if enrichment.get("what_i_can_offer"):
                         existing["what_i_can_offer"] = enrichment["what_i_can_offer"]
                     if enrichment.get("what_they_offer_me"):
                         existing["what_they_offer_me"] = enrichment["what_they_offer_me"]
                     if enrichment.get("contact_type"):
                         existing["contact_type"] = enrichment["contact_type"]
-
-                    # Append enrichment summary to notes
                     org_ctx = enrichment.get("org_description", "")
                     person_ctx = enrichment.get("person_summary", "")
                     recent = enrichment.get("org_recent_activity", "")
@@ -594,7 +710,6 @@ async def enrich_bucket(bucket_id: str, payload: BucketEnrichPayload):
                         existing_notes = existing.get("notes", "") or ""
                         if "[Enriched" not in existing_notes:
                             existing["notes"] = (existing_notes + enrich_note).strip()
-
                     profile_text = " | ".join(filter(None, [
                         f"Name: {existing.get('full_name', '')}",
                         f"Role: {existing.get('title_role', '')}",
@@ -623,6 +738,59 @@ async def enrich_bucket(bucket_id: str, payload: BucketEnrichPayload):
         "next_offset": payload.offset + payload.batch_size if has_more else None,
         "results": results,
     }
+
+# ── NEW: BACKGROUND ENRICH-ALL ────────────────────────────────────────────────
+
+@app.post("/bucket/{bucket_id}/enrich-all", dependencies=[Depends(require_api_key)])
+async def enrich_bucket_all(bucket_id: str, payload: BucketEnrichAllPayload, background_tasks: BackgroundTasks):
+    """
+    Kick off a background job that enriches every unenriched contact in the bucket,
+    one at a time, with a 3s pause between each.
+    Skips contacts that already have what_i_can_offer populated.
+    Tracks estimated cost and halts if spend exceeds $5.
+    Returns a job_id immediately. Poll /bucket/{bucket_id}/enrich-status?job_id=... to check progress.
+    """
+    bucket = await get_bucket(bucket_id)
+    if not bucket: raise HTTPException(status_code=404, detail="Bucket not found")
+
+    job_id = f"JOB-{int(time.time() * 1000)}"
+    _enrich_jobs[job_id] = {
+        "job_id": job_id,
+        "bucket_id": bucket_id,
+        "status": "queued",
+        "total": 0,
+        "to_enrich": 0,
+        "processed": 0,
+        "succeeded": 0,
+        "skipped_already_done": 0,
+        "failed": [],
+        "estimated_cost_usd": 0.0,
+        "cost_halted": False,
+        "current_contact": None,
+        "message": None,
+        "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+
+    background_tasks.add_task(_run_enrich_all_job, job_id, bucket_id, payload.campaign_context)
+
+    return {
+        "success": True,
+        "job_id": job_id,
+        "bucket_id": bucket_id,
+        "message": "Enrichment job started in background. Poll /bucket/{bucket_id}/enrich-status?job_id={job_id} to check progress.",
+        "cost_warning_threshold_usd": COST_WARNING_THRESHOLD,
+    }
+
+
+@app.get("/bucket/{bucket_id}/enrich-status", dependencies=[Depends(require_api_key)])
+async def get_enrich_status(bucket_id: str, job_id: str):
+    """
+    Check the status of a background enrichment job.
+    """
+    job = _enrich_jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Job {job_id} not found. Jobs are cleared on Railway restart.")
+    return {"success": True, "job": job}
 
 # ════════════════════════════════════════════════════════════════════════════
 # INITIATIVES / SUB-PROJECTS / STAKEHOLDERS
@@ -894,7 +1062,7 @@ async def create_event(payload: EventPayload):
 async def update_event(event_id: str, payload: EventPayload):
     existing = await get_event(event_id)
     if not existing: raise HTTPException(status_code=404, detail="Event not found")
-    data = {**existing, **{k: v for k, v in payload.dict().items() if v is not None}}; data["event_id"] = event_id
+    data = {**existing, **{k: v for k, v in payload.dict().items() if v is not None and v != ""}}; data["event_id"] = event_id
     await upsert_event(event_id, data); return {"success": True}
 
 @app.patch("/event/{event_id}/status", dependencies=[Depends(require_api_key)])
@@ -908,28 +1076,27 @@ async def update_event_status(event_id: str, payload: EventStatusUpdate):
 async def remove_event(event_id: str):
     await delete_event(event_id); return {"success": True}
 
-@app.get("/event/{event_id}/guests", dependencies=[Depends(require_api_key)])
-async def list_event_guests(event_id: str):
-    guests = await get_guests_for_event(event_id); return {"success": True, "data": guests, "count": len(guests)}
-
 @app.post("/event-guest", dependencies=[Depends(require_api_key)])
 async def add_event_guest(payload: EventGuestPayload):
-    guest_id = payload.guest_id or f"EG-{int(time.time() * 1000)}"; data = payload.dict(); data["guest_id"] = guest_id
-    await upsert_event_guest(guest_id, payload.event_id, payload.contact_id or "", data); return {"success": True, "guest_id": guest_id}
+    guest_id = payload.guest_id or f"GST-{int(time.time() * 1000)}"; data = payload.dict(); data["guest_id"] = guest_id
+    await upsert_event_guest(guest_id, payload.event_id, data); return {"success": True, "guest_id": guest_id}
 
 @app.patch("/event-guest/{guest_id}", dependencies=[Depends(require_api_key)])
 async def update_event_guest(guest_id: str, payload: EventGuestUpdate):
     from db import _conn; import json as _json; conn = await _conn()
     try:
-        row = await conn.fetchrow("SELECT event_id, contact_id, data FROM event_guests WHERE guest_id = $1", guest_id)
-        if not row: raise HTTPException(status_code=404, detail="Event guest not found")
+        row = await conn.fetchrow("SELECT data, event_id FROM event_guests WHERE guest_id = $1", guest_id)
+        if not row: raise HTTPException(status_code=404, detail="Guest not found")
         data = _json.loads(row["data"])
-        if payload.role is not None: data["role"] = payload.role
-        if payload.guest_status is not None: data["guest_status"] = payload.guest_status
-        if payload.notes is not None: data["notes"] = payload.notes
-        await upsert_event_guest(guest_id, row["event_id"], row["contact_id"], data); return {"success": True}
+        if payload.guest_status: data["guest_status"] = payload.guest_status
+        if payload.notes: data["notes"] = payload.notes
+        await upsert_event_guest(guest_id, row["event_id"], data); return {"success": True}
     finally: await conn.close()
 
 @app.delete("/event-guest/{guest_id}", dependencies=[Depends(require_api_key)])
 async def remove_event_guest(guest_id: str):
     await delete_event_guest(guest_id); return {"success": True}
+
+@app.get("/event/{event_id}/guests", dependencies=[Depends(require_api_key)])
+async def list_event_guests(event_id: str):
+    data = await get_guests_for_event(event_id); return {"success": True, "data": data, "count": len(data)}
