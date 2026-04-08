@@ -93,6 +93,20 @@ class ActivationAnglePayload(BaseModel):
     effectiveness_notes: Optional[str] = ""
 
 
+class BucketAnglesUpdate(BaseModel):
+    """Set the bucket-level activation angle defaults. Replaces the full list."""
+    angle_ids: List[str]
+
+
+class ContactBucketAnglesUpdate(BaseModel):
+    """
+    Override activation angles for a specific contact within a bucket.
+    Supplying an empty list clears the override and keeps the row (contact reverts to bucket defaults on next read).
+    Call DELETE /bucket/{id}/members/{contact_id}/angles to fully remove the override row.
+    """
+    angle_ids: List[str]
+
+
 # ── ACTION ITEMS ──────────────────────────────────────────────────────────────
 
 class ActionItemPayload(BaseModel):
