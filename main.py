@@ -31,6 +31,7 @@ from db import (
     get_buckets_for_contact, get_contacts_in_bucket, get_buckets_for_initiative,
     brain_dump_insert,
     add_contact_note, get_contact_notes, delete_contact_note,
+    set_bucket_angles, set_contact_bucket_angles, get_contact_bucket_angles, delete_contact_bucket_angles,
 )
 from embedder import embed_profile, embed_query
 from matcher import find_matches, find_matches_by_vector
@@ -48,6 +49,7 @@ from models import (
     EventPayload, EventStatusUpdate,
     EventGuestPayload, EventGuestUpdate,
     CandidacyUpdate, DraftOutreachPayload, InitiativeLinkPayload, CANDIDACY_STATUSES,
+    BucketAnglesUpdate, ContactBucketAnglesUpdate,
 )
 
 app = FastAPI(title="Super Connector API")
@@ -645,6 +647,53 @@ async def remove_member_from_bucket(bucket_id: str, contact_id: str):
 @app.delete("/bucket/{bucket_id}", dependencies=[Depends(require_api_key)])
 async def remove_bucket(bucket_id: str):
     await delete_bucket(bucket_id); return {"success": True}
+
+# ── BUCKET ACTIVATION ANGLES ──────────────────────────────────────────────────
+
+@app.patch("/bucket/{bucket_id}/angles", dependencies=[Depends(require_api_key)])
+async def set_angles_for_bucket(bucket_id: str, payload: BucketAnglesUpdate):
+    """Set the bucket-level activation angle defaults. Replaces the full list."""
+    bucket = await get_bucket(bucket_id)
+    if not bucket: raise HTTPException(status_code=404, detail="Bucket not found")
+    ok = await set_bucket_angles(bucket_id, payload.angle_ids)
+    if not ok: raise HTTPException(status_code=500, detail="Failed to update bucket angles")
+    return {"success": True, "bucket_id": bucket_id, "activation_angle_ids": payload.angle_ids}
+
+@app.patch("/bucket/{bucket_id}/members/{contact_id}/angles", dependencies=[Depends(require_api_key)])
+async def set_angles_for_contact_in_bucket(bucket_id: str, contact_id: str, payload: ContactBucketAnglesUpdate):
+    """
+    Override activation angles for a specific contact within a bucket.
+    An empty list means the override exists but selects no angles (contact excluded from angle-based sends).
+    Call DELETE to fully remove the override and revert to bucket defaults.
+    """
+    bucket = await get_bucket(bucket_id)
+    if not bucket: raise HTTPException(status_code=404, detail="Bucket not found")
+    await set_contact_bucket_angles(bucket_id, contact_id, payload.angle_ids)
+    return {"success": True, "bucket_id": bucket_id, "contact_id": contact_id, "angle_ids": payload.angle_ids}
+
+@app.get("/bucket/{bucket_id}/members/{contact_id}/angles", dependencies=[Depends(require_api_key)])
+async def get_angles_for_contact_in_bucket(bucket_id: str, contact_id: str):
+    """
+    Return the effective activation angles for a contact in a bucket.
+    If a per-contact override exists, returns that. Otherwise returns the bucket-level defaults.
+    source: "contact_override" | "bucket_default"
+    """
+    override = await get_contact_bucket_angles(bucket_id, contact_id)
+    if override is not None:
+        return {"success": True, "bucket_id": bucket_id, "contact_id": contact_id,
+                "angle_ids": override, "source": "contact_override"}
+    bucket = await get_bucket(bucket_id)
+    if not bucket: raise HTTPException(status_code=404, detail="Bucket not found")
+    bucket_angles = bucket.get("activation_angle_ids", [])
+    return {"success": True, "bucket_id": bucket_id, "contact_id": contact_id,
+            "angle_ids": bucket_angles, "source": "bucket_default"}
+
+@app.delete("/bucket/{bucket_id}/members/{contact_id}/angles", dependencies=[Depends(require_api_key)])
+async def clear_contact_angle_override(bucket_id: str, contact_id: str):
+    """Remove per-contact angle override. Contact will inherit bucket-level angles again."""
+    await delete_contact_bucket_angles(bucket_id, contact_id)
+    return {"success": True, "bucket_id": bucket_id, "contact_id": contact_id,
+            "message": "Override removed. Contact now inherits bucket-level angles."}
 
 @app.post("/bucket/from-search", dependencies=[Depends(require_api_key)])
 async def create_bucket_from_search(payload: BucketFromSearchPayload):
