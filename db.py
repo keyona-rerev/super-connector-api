@@ -148,6 +148,21 @@ async def init_db():
         await conn.execute("CREATE INDEX IF NOT EXISTS contact_buckets_contact_idx ON contact_buckets (contact_id);")
         await conn.execute("CREATE INDEX IF NOT EXISTS contact_buckets_bucket_idx ON contact_buckets (bucket_id);")
 
+        # Per-contact angle overrides within a bucket.
+        # When angle_ids is NULL the contact inherits the bucket-level angles.
+        # When set, it overrides for that specific contact only.
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS contact_bucket_angles (
+                bucket_id TEXT NOT NULL,
+                contact_id TEXT NOT NULL,
+                angle_ids JSONB NOT NULL DEFAULT '[]',
+                updated_at TIMESTAMP DEFAULT NOW(),
+                PRIMARY KEY (bucket_id, contact_id)
+            );
+        """)
+        await conn.execute("CREATE INDEX IF NOT EXISTS cba_contact_idx ON contact_bucket_angles (contact_id);")
+        await conn.execute("CREATE INDEX IF NOT EXISTS cba_bucket_idx ON contact_bucket_angles (bucket_id);")
+
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS organizations (
                 org_id TEXT PRIMARY KEY,
@@ -160,10 +175,6 @@ async def init_db():
         await conn.execute("CREATE INDEX IF NOT EXISTS organizations_name_lower_idx ON organizations (LOWER(data->>'name'));")
         await conn.execute("CREATE INDEX IF NOT EXISTS organizations_embedding_idx ON organizations USING ivfflat (embedding vector_cosine_ops) WITH (lists = 10);")
 
-        # ── CONTACT NOTES (activity log) ──────────────────────────────────────
-        # Timestamped entries for each contact. Source distinguishes how the entry
-        # was created: manual (you typed it), transcript (T018 auto-created),
-        # enrichment (AI research), or system (connection date, field changes).
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS contact_notes (
                 note_id TEXT PRIMARY KEY,
@@ -567,6 +578,71 @@ async def delete_activation_angle(angle_id: str):
     finally:
         await conn.close()
 
+# ── BUCKET ACTIVATION ANGLES ──────────────────────────────────────────────────
+# Bucket-level: stored in the bucket's JSONB data blob as activation_angle_ids: [...]
+# Per-contact override: contact_bucket_angles table
+
+async def set_bucket_angles(bucket_id: str, angle_ids: list):
+    """Merge activation_angle_ids into the bucket's data blob."""
+    conn = await _conn()
+    try:
+        row = await conn.fetchrow("SELECT data FROM buckets WHERE bucket_id = $1", bucket_id)
+        if not row:
+            return False
+        data = json.loads(row["data"])
+        data["activation_angle_ids"] = angle_ids
+        await conn.execute(
+            "UPDATE buckets SET data = $1, updated_at = NOW() WHERE bucket_id = $2",
+            json.dumps(data), bucket_id
+        )
+        return True
+    finally:
+        await conn.close()
+
+async def set_contact_bucket_angles(bucket_id: str, contact_id: str, angle_ids: list):
+    """
+    Upsert per-contact angle override for a specific bucket membership.
+    Pass an empty list [] to reset to bucket defaults (row still exists, angle_ids=[]).
+    Pass None to delete the override entirely (rare).
+    """
+    conn = await _conn()
+    try:
+        await conn.execute("""
+            INSERT INTO contact_bucket_angles (bucket_id, contact_id, angle_ids, updated_at)
+            VALUES ($1, $2, $3, NOW())
+            ON CONFLICT (bucket_id, contact_id)
+            DO UPDATE SET angle_ids = EXCLUDED.angle_ids, updated_at = NOW();
+        """, bucket_id, contact_id, json.dumps(angle_ids))
+    finally:
+        await conn.close()
+
+async def get_contact_bucket_angles(bucket_id: str, contact_id: str):
+    """
+    Returns the effective angle_ids for a contact in a bucket.
+    If no per-contact override exists, returns None (caller should fall back to bucket-level angles).
+    If override exists (even empty list), returns that list.
+    """
+    conn = await _conn()
+    try:
+        row = await conn.fetchrow(
+            "SELECT angle_ids FROM contact_bucket_angles WHERE bucket_id = $1 AND contact_id = $2",
+            bucket_id, contact_id
+        )
+        return json.loads(row["angle_ids"]) if row else None
+    finally:
+        await conn.close()
+
+async def delete_contact_bucket_angles(bucket_id: str, contact_id: str):
+    """Remove per-contact override, reverting contact to bucket-level defaults."""
+    conn = await _conn()
+    try:
+        await conn.execute(
+            "DELETE FROM contact_bucket_angles WHERE bucket_id = $1 AND contact_id = $2",
+            bucket_id, contact_id
+        )
+    finally:
+        await conn.close()
+
 # ── ACTION ITEMS ──────────────────────────────────────────────────────────────
 
 async def upsert_action_item(action_id: str, initiative_id: str, stakeholder_id: str, data: dict):
@@ -871,6 +947,7 @@ async def get_buckets_for_initiative(initiative_id: str):
 async def delete_bucket(bucket_id: str):
     conn = await _conn()
     try:
+        await conn.execute("DELETE FROM contact_bucket_angles WHERE bucket_id = $1", bucket_id)
         await conn.execute("DELETE FROM contact_buckets WHERE bucket_id = $1", bucket_id)
         await conn.execute("DELETE FROM buckets WHERE bucket_id = $1", bucket_id)
     finally:
@@ -886,6 +963,7 @@ async def add_contact_to_bucket(bucket_id: str, contact_id: str):
 async def remove_contact_from_bucket(bucket_id: str, contact_id: str):
     conn = await _conn()
     try:
+        await conn.execute("DELETE FROM contact_bucket_angles WHERE bucket_id = $1 AND contact_id = $2", bucket_id, contact_id)
         await conn.execute("DELETE FROM contact_buckets WHERE bucket_id = $1 AND contact_id = $2", bucket_id, contact_id)
     finally:
         await conn.close()
