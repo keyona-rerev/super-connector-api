@@ -97,14 +97,14 @@ async def _run_enrich_all_job(job_id: str, bucket_id: str, campaign_context: str
     """
     Background task: enrich every unenriched contact in a bucket one at a time.
     Tracks estimated cost. Halts and flags if spend exceeds COST_WARNING_THRESHOLD.
-    Skips contacts that already have what_i_can_offer populated.
+    Skips contacts that already have what_they_offer_me populated.
     """
     job = _enrich_jobs[job_id]
     job["status"] = "running"
 
     try:
         all_contacts = await get_contacts_in_bucket(bucket_id)
-        to_enrich = [c for c in all_contacts if not (c.get("what_i_can_offer") or "").strip()]
+        to_enrich = [c for c in all_contacts if not (c.get("what_they_offer_me") or "").strip()]
 
         job["total"] = len(all_contacts)
         job["to_enrich"] = len(to_enrich)
@@ -118,7 +118,6 @@ async def _run_enrich_all_job(job_id: str, bucket_id: str, campaign_context: str
         loop = asyncio.get_event_loop()
 
         for i, contact in enumerate(to_enrich):
-            # Check cost before each contact
             if job["estimated_cost_usd"] >= COST_WARNING_THRESHOLD:
                 job["cost_halted"] = True
                 job["status"] = "halted_cost_limit"
@@ -135,10 +134,7 @@ async def _run_enrich_all_job(job_id: str, bucket_id: str, campaign_context: str
             job["current_contact"] = name
 
             try:
-                # Org pass for just this one contact
                 org_cache = await loop.run_in_executor(None, enrich_org_pass, [contact])
-
-                # Contact enrichment pass
                 result = await loop.run_in_executor(
                     None, enrich_and_draft, contact, campaign_context, org_cache
                 )
@@ -146,14 +142,11 @@ async def _run_enrich_all_job(job_id: str, bucket_id: str, campaign_context: str
                 enrichment = result.get("enrichment", {})
                 status = enrichment.get("enrichment_status", "")
 
-                # Estimate tokens: org prompt ~800 in/200 out, contact prompt ~1200 in/400 out
                 job["estimated_cost_usd"] += _estimate_cost(2000, 600)
 
                 if status == "enriched":
                     existing = await get_contact(contact_id)
                     if existing:
-                        if enrichment.get("what_i_can_offer"):
-                            existing["what_i_can_offer"] = enrichment["what_i_can_offer"]
                         if enrichment.get("what_they_offer_me"):
                             existing["what_they_offer_me"] = enrichment["what_they_offer_me"]
                         if enrichment.get("contact_type"):
@@ -176,7 +169,6 @@ async def _run_enrich_all_job(job_id: str, bucket_id: str, campaign_context: str
                             f"Name: {existing.get('full_name', '')}",
                             f"Role: {existing.get('title_role', '')}",
                             f"Org: {existing.get('organization', '')}",
-                            f"What I can offer: {existing.get('what_i_can_offer', '')}",
                             f"What they offer me: {existing.get('what_they_offer_me', '')}",
                             f"Notes: {existing.get('notes', '')}",
                         ]))
@@ -191,7 +183,6 @@ async def _run_enrich_all_job(job_id: str, bucket_id: str, campaign_context: str
 
             job["processed"] += 1
 
-            # 3s pause between contacts — enough breathing room without being slow
             if i < len(to_enrich) - 1:
                 await asyncio.sleep(3)
 
@@ -224,7 +215,6 @@ class ContactPayload(BaseModel):
     what_building: Optional[str] = ""
     what_need: Optional[str] = ""
     what_offer: Optional[str] = ""
-    what_i_can_offer: Optional[str] = ""
     what_they_offer_me: Optional[str] = ""
     contact_type: Optional[str] = ""
     outreach_candidacy: Optional[str] = ""
@@ -234,6 +224,11 @@ class ContactPayload(BaseModel):
     imported_via: Optional[str] = ""
     active_advocacy: Optional[bool] = False
     notes: Optional[str] = ""
+    # ── Piper fields ──────────────────────────────────────────────────────
+    piper_initiatives: Optional[str] = ""
+    piper_seeking: Optional[str] = ""
+    piper_activated: Optional[bool] = False
+    piper_replied_at: Optional[str] = None
 
 class BulkPayload(BaseModel):
     contacts: list[ContactPayload]
@@ -328,8 +323,9 @@ def _build_profile_text(contact: ContactPayload) -> str:
         f"How we met: {contact.how_we_met}" if contact.how_we_met else "",
         f"What they're building: {contact.what_building}" if contact.what_building else "",
         f"What they need: {contact.what_need}" if contact.what_need else "",
-        f"What I can offer them: {contact.what_i_can_offer}" if contact.what_i_can_offer else "",
         f"What they offer me: {contact.what_they_offer_me}" if contact.what_they_offer_me else "",
+        f"Piper initiatives: {contact.piper_initiatives}" if contact.piper_initiatives else "",
+        f"Piper seeking: {contact.piper_seeking}" if contact.piper_seeking else "",
         f"Met at: {contact.source}" if contact.source else "",
         f"Notes: {contact.notes}" if contact.notes else "",
     ]
@@ -545,8 +541,7 @@ async def update_candidacy(contact_id: str, payload: CandidacyUpdate):
         f"Name: {contact.get('full_name', '')}",
         f"Role: {contact.get('title_role', '')}",
         f"Org: {contact.get('organization', '')}",
-        f"What I can offer: {contact.get('what_i_can_offer', '')}",
-        f"What they offer: {contact.get('what_they_offer_me', '')}",
+        f"What they offer me: {contact.get('what_they_offer_me', '')}",
         f"Notes: {contact.get('notes', '')}",
     ]))
     await store_contact(contact_id, contact, embed_profile(profile_text))
@@ -652,7 +647,6 @@ async def remove_bucket(bucket_id: str):
 
 @app.patch("/bucket/{bucket_id}/angles", dependencies=[Depends(require_api_key)])
 async def set_angles_for_bucket(bucket_id: str, payload: BucketAnglesUpdate):
-    """Set the bucket-level activation angle defaults. Replaces the full list."""
     bucket = await get_bucket(bucket_id)
     if not bucket: raise HTTPException(status_code=404, detail="Bucket not found")
     ok = await set_bucket_angles(bucket_id, payload.angle_ids)
@@ -661,11 +655,6 @@ async def set_angles_for_bucket(bucket_id: str, payload: BucketAnglesUpdate):
 
 @app.patch("/bucket/{bucket_id}/members/{contact_id}/angles", dependencies=[Depends(require_api_key)])
 async def set_angles_for_contact_in_bucket(bucket_id: str, contact_id: str, payload: ContactBucketAnglesUpdate):
-    """
-    Override activation angles for a specific contact within a bucket.
-    An empty list means the override exists but selects no angles (contact excluded from angle-based sends).
-    Call DELETE to fully remove the override and revert to bucket defaults.
-    """
     bucket = await get_bucket(bucket_id)
     if not bucket: raise HTTPException(status_code=404, detail="Bucket not found")
     await set_contact_bucket_angles(bucket_id, contact_id, payload.angle_ids)
@@ -673,11 +662,6 @@ async def set_angles_for_contact_in_bucket(bucket_id: str, contact_id: str, payl
 
 @app.get("/bucket/{bucket_id}/members/{contact_id}/angles", dependencies=[Depends(require_api_key)])
 async def get_angles_for_contact_in_bucket(bucket_id: str, contact_id: str):
-    """
-    Return the effective activation angles for a contact in a bucket.
-    If a per-contact override exists, returns that. Otherwise returns the bucket-level defaults.
-    source: "contact_override" | "bucket_default"
-    """
     override = await get_contact_bucket_angles(bucket_id, contact_id)
     if override is not None:
         return {"success": True, "bucket_id": bucket_id, "contact_id": contact_id,
@@ -690,7 +674,6 @@ async def get_angles_for_contact_in_bucket(bucket_id: str, contact_id: str):
 
 @app.delete("/bucket/{bucket_id}/members/{contact_id}/angles", dependencies=[Depends(require_api_key)])
 async def clear_contact_angle_override(bucket_id: str, contact_id: str):
-    """Remove per-contact angle override. Contact will inherit bucket-level angles again."""
     await delete_contact_bucket_angles(bucket_id, contact_id)
     return {"success": True, "bucket_id": bucket_id, "contact_id": contact_id,
             "message": "Override removed. Contact now inherits bucket-level angles."}
@@ -710,7 +693,7 @@ async def create_bucket_from_search(payload: BucketFromSearchPayload):
         return {"success": True, "mode": "committed", "bucket_id": bucket_id, "bucket_name": payload.bucket_name, "contacts_added": len(added), "contacts": matches}
     except Exception as e: raise HTTPException(status_code=500, detail=str(e))
 
-# ── LEGACY BATCH ENRICH (kept for backward compat) ────────────────────────────
+# ── LEGACY BATCH ENRICH ────────────────────────────────────────────────────────
 
 @app.post("/bucket/{bucket_id}/enrich", dependencies=[Depends(require_api_key)])
 async def enrich_bucket(bucket_id: str, payload: BucketEnrichPayload):
@@ -741,8 +724,6 @@ async def enrich_bucket(bucket_id: str, payload: BucketEnrichPayload):
                 enrichment = result["enrichment"]
                 existing = await get_contact(contact["contact_id"])
                 if existing:
-                    if enrichment.get("what_i_can_offer"):
-                        existing["what_i_can_offer"] = enrichment["what_i_can_offer"]
                     if enrichment.get("what_they_offer_me"):
                         existing["what_they_offer_me"] = enrichment["what_they_offer_me"]
                     if enrichment.get("contact_type"):
@@ -763,7 +744,6 @@ async def enrich_bucket(bucket_id: str, payload: BucketEnrichPayload):
                         f"Name: {existing.get('full_name', '')}",
                         f"Role: {existing.get('title_role', '')}",
                         f"Org: {existing.get('organization', '')}",
-                        f"What I can offer: {existing.get('what_i_can_offer', '')}",
                         f"What they offer me: {existing.get('what_they_offer_me', '')}",
                         f"Notes: {existing.get('notes', '')}",
                     ]))
@@ -792,13 +772,6 @@ async def enrich_bucket(bucket_id: str, payload: BucketEnrichPayload):
 
 @app.post("/bucket/{bucket_id}/enrich-all", dependencies=[Depends(require_api_key)])
 async def enrich_bucket_all(bucket_id: str, payload: BucketEnrichAllPayload, background_tasks: BackgroundTasks):
-    """
-    Kick off a background job that enriches every unenriched contact in the bucket,
-    one at a time, with a 3s pause between each.
-    Skips contacts that already have what_i_can_offer populated.
-    Tracks estimated cost and halts if spend exceeds $5.
-    Returns a job_id immediately. Poll /bucket/{bucket_id}/enrich-status?job_id=... to check progress.
-    """
     bucket = await get_bucket(bucket_id)
     if not bucket: raise HTTPException(status_code=404, detail="Bucket not found")
 
@@ -833,9 +806,6 @@ async def enrich_bucket_all(bucket_id: str, payload: BucketEnrichAllPayload, bac
 
 @app.get("/bucket/{bucket_id}/enrich-status", dependencies=[Depends(require_api_key)])
 async def get_enrich_status(bucket_id: str, job_id: str):
-    """
-    Check the status of a background enrichment job.
-    """
     job = _enrich_jobs.get(job_id)
     if not job:
         raise HTTPException(status_code=404, detail=f"Job {job_id} not found. Jobs are cleared on Railway restart.")
@@ -956,28 +926,24 @@ async def list_action_items_for_initiative(initiative_id: str):
 @app.post("/action-item", dependencies=[Depends(require_api_key)])
 async def create_action_item(payload: ActionItemPayload):
     action_id = payload.action_id or f"ACT-{int(time.time() * 1000)}"; data = payload.dict(); data["action_id"] = action_id
-    await upsert_action_item(action_id, payload.initiative_id or "SPRINT", payload.stakeholder_id or "", data); return {"success": True, "action_id": action_id}
-
-@app.put("/action-item/{action_id}", dependencies=[Depends(require_api_key)])
-async def update_action_item(action_id: str, payload: ActionItemPayload):
-    data = payload.dict(); data["action_id"] = action_id; await upsert_action_item(action_id, payload.initiative_id or "SPRINT", payload.stakeholder_id or "", data); return {"success": True}
+    await upsert_action_item(action_id, payload.initiative_id or "", data); return {"success": True, "action_id": action_id}
 
 @app.patch("/action-item/{action_id}/status", dependencies=[Depends(require_api_key)])
 async def update_action_item_status(action_id: str, payload: ActionItemStatusUpdate):
     from db import _conn; import json as _json; conn = await _conn()
     try:
-        row = await conn.fetchrow("SELECT data, initiative_id, stakeholder_id FROM action_items WHERE action_id = $1", action_id)
+        row = await conn.fetchrow("SELECT data, initiative_id FROM action_items WHERE action_id = $1", action_id)
         if not row: raise HTTPException(status_code=404, detail="Action item not found")
         data = _json.loads(row["data"]); data["status"] = payload.status
         if payload.completed_date: data["completed_date"] = payload.completed_date
         if payload.google_task_id: data["google_task_id"] = payload.google_task_id
-        await upsert_action_item(action_id, row["initiative_id"], row["stakeholder_id"], data); return {"success": True}
+        await upsert_action_item(action_id, row["initiative_id"], data); return {"success": True}
     finally: await conn.close()
 
 @app.get("/action-item/by-google-task/{google_task_id}", dependencies=[Depends(require_api_key)])
-async def get_by_google_task_id(google_task_id: str):
+async def get_action_by_google_task(google_task_id: str):
     data = await get_action_item_by_google_task_id(google_task_id)
-    if not data: raise HTTPException(status_code=404, detail="No action item found for this Google Task ID")
+    if not data: raise HTTPException(status_code=404, detail="Action item not found")
     return {"success": True, "data": data}
 
 @app.delete("/action-item/{action_id}", dependencies=[Depends(require_api_key)])
@@ -985,12 +951,12 @@ async def remove_action_item(action_id: str):
     await delete_action_item(action_id); return {"success": True}
 
 # ════════════════════════════════════════════════════════════════════════════
-# CONTENT / FOLLOW-UPS / EVENTS
+# CONTENT
 # ════════════════════════════════════════════════════════════════════════════
 
 @app.get("/content", dependencies=[Depends(require_api_key)])
 async def list_content():
-    return {"success": True, "data": await get_all_content(), "count": len(await get_all_content())}
+    data = await get_all_content(); return {"success": True, "data": data, "count": len(data)}
 
 @app.get("/content/{content_id}", dependencies=[Depends(require_api_key)])
 async def get_content_by_id(content_id: str):
@@ -999,54 +965,46 @@ async def get_content_by_id(content_id: str):
     return {"success": True, "data": data}
 
 @app.post("/content", dependencies=[Depends(require_api_key)])
-async def upsert_content(payload: ContentPayload):
-    try:
-        content_id = payload.content_id or f"C-{int(time.time() * 1000)}"; data = payload.dict(); data["content_id"] = content_id
-        await store_content(content_id, data, embed_profile(_build_content_text(payload))); return {"success": True, "content_id": content_id}
-    except Exception as e: raise HTTPException(status_code=500, detail=str(e))
+async def create_content(payload: ContentPayload):
+    content_id = payload.content_id or f"CON-{int(time.time() * 1000)}"; data = payload.dict(); data["content_id"] = content_id
+    await store_content(content_id, data, embed_profile(_build_content_text(payload))); return {"success": True, "content_id": content_id}
 
 @app.put("/content/{content_id}", dependencies=[Depends(require_api_key)])
 async def update_content(content_id: str, payload: ContentPayload):
-    try:
-        data = payload.dict(); data["content_id"] = content_id
-        await store_content(content_id, data, embed_profile(_build_content_text(payload))); return {"success": True, "content_id": content_id}
-    except Exception as e: raise HTTPException(status_code=500, detail=str(e))
+    data = payload.dict(); data["content_id"] = content_id
+    await store_content(content_id, data, embed_profile(_build_content_text(payload))); return {"success": True}
 
 @app.patch("/content/{content_id}/status", dependencies=[Depends(require_api_key)])
 async def update_content_status(content_id: str, payload: ContentStatusUpdate):
     from db import _conn; import json as _json; conn = await _conn()
     try:
-        row = await conn.fetchrow("SELECT data, embedding FROM content WHERE content_id = $1", content_id)
+        row = await conn.fetchrow("SELECT data FROM content WHERE content_id = $1", content_id)
         if not row: raise HTTPException(status_code=404, detail="Content not found")
         data = _json.loads(row["data"]); data["status"] = payload.status
         if payload.prismm_sync is not None: data["prismm_sync"] = payload.prismm_sync
-        existing_vector = list(row["embedding"]) if row["embedding"] else None
-        if existing_vector: await store_content(content_id, data, existing_vector)
-        else: await conn.execute("UPDATE content SET data = $1, updated_at = NOW() WHERE content_id = $2", _json.dumps(data), content_id)
-        return {"success": True}
+        await store_content(content_id, data, None); return {"success": True}
     finally: await conn.close()
-
-@app.post("/content/search", dependencies=[Depends(require_api_key)])
-async def search_content(request: SearchRequest):
-    try: return {"query": request.query, "results": await search_content_by_vector(embed_query(request.query), limit=request.top_k)}
-    except Exception as e: raise HTTPException(status_code=500, detail=str(e))
 
 @app.delete("/content/{content_id}", dependencies=[Depends(require_api_key)])
 async def remove_content(content_id: str):
     await delete_content(content_id); return {"success": True}
 
-@app.get("/follow-ups/open", dependencies=[Depends(require_api_key)])
-async def list_open_follow_ups():
+@app.post("/content/search", dependencies=[Depends(require_api_key)])
+async def search_content(request: SearchRequest):
+    results = await search_content_by_vector(embed_query(request.query), limit=request.top_k)
+    return {"success": True, "query": request.query, "results": results}
+
+# ════════════════════════════════════════════════════════════════════════════
+# FOLLOW-UPS
+# ════════════════════════════════════════════════════════════════════════════
+
+@app.get("/follow-ups", dependencies=[Depends(require_api_key)])
+async def list_follow_ups():
     data = await get_open_follow_ups(); return {"success": True, "data": data, "count": len(data)}
 
 @app.get("/follow-ups/overdue", dependencies=[Depends(require_api_key)])
-async def list_overdue_follow_ups(as_of: Optional[str] = None):
-    from datetime import date; as_of_date = as_of or date.today().isoformat()
-    data = await get_overdue_follow_ups(as_of_date); return {"success": True, "data": data, "count": len(data), "as_of": as_of_date}
-
-@app.get("/contact/{contact_id}/follow-ups", dependencies=[Depends(require_api_key)])
-async def list_follow_ups_for_contact(contact_id: str):
-    data = await get_follow_ups_for_contact(contact_id); return {"success": True, "data": data, "count": len(data)}
+async def list_overdue_follow_ups():
+    data = await get_overdue_follow_ups(); return {"success": True, "data": data, "count": len(data)}
 
 @app.get("/follow-up/{follow_up_id}", dependencies=[Depends(require_api_key)])
 async def get_follow_up_by_id(follow_up_id: str):
@@ -1054,53 +1012,54 @@ async def get_follow_up_by_id(follow_up_id: str):
     if not data: raise HTTPException(status_code=404, detail="Follow-up not found")
     return {"success": True, "data": data}
 
+@app.get("/contact/{contact_id}/follow-ups", dependencies=[Depends(require_api_key)])
+async def get_follow_ups_for_contact_route(contact_id: str):
+    data = await get_follow_ups_for_contact(contact_id); return {"success": True, "data": data, "count": len(data)}
+
 @app.post("/follow-up", dependencies=[Depends(require_api_key)])
-async def upsert_follow_up(payload: FollowUpPayload):
-    try:
-        follow_up_id = payload.follow_up_id or f"FU-{int(time.time() * 1000)}"; data = payload.dict(); data["follow_up_id"] = follow_up_id
-        await store_follow_up(follow_up_id, payload.contact_id or "", data, embed_profile(_build_follow_up_text(payload))); return {"success": True, "follow_up_id": follow_up_id}
-    except Exception as e: raise HTTPException(status_code=500, detail=str(e))
+async def create_follow_up(payload: FollowUpPayload):
+    follow_up_id = payload.follow_up_id or f"FU-{int(time.time() * 1000)}"; data = payload.dict(); data["follow_up_id"] = follow_up_id
+    await store_follow_up(follow_up_id, data, embed_profile(_build_follow_up_text(payload))); return {"success": True, "follow_up_id": follow_up_id}
 
 @app.put("/follow-up/{follow_up_id}", dependencies=[Depends(require_api_key)])
 async def update_follow_up(follow_up_id: str, payload: FollowUpPayload):
-    try:
-        data = payload.dict(); data["follow_up_id"] = follow_up_id
-        await store_follow_up(follow_up_id, payload.contact_id or "", data, embed_profile(_build_follow_up_text(payload))); return {"success": True, "follow_up_id": follow_up_id}
-    except Exception as e: raise HTTPException(status_code=500, detail=str(e))
+    data = payload.dict(); data["follow_up_id"] = follow_up_id
+    await store_follow_up(follow_up_id, data, embed_profile(_build_follow_up_text(payload))); return {"success": True}
 
 @app.patch("/follow-up/{follow_up_id}/status", dependencies=[Depends(require_api_key)])
 async def update_follow_up_status(follow_up_id: str, payload: FollowUpStatusUpdate):
     from db import _conn; import json as _json; conn = await _conn()
     try:
-        row = await conn.fetchrow("SELECT data, contact_id, embedding FROM follow_ups WHERE follow_up_id = $1", follow_up_id)
+        row = await conn.fetchrow("SELECT data FROM follow_ups WHERE follow_up_id = $1", follow_up_id)
         if not row: raise HTTPException(status_code=404, detail="Follow-up not found")
         data = _json.loads(row["data"]); data["status"] = payload.status
         if payload.completed_date: data["completed_date"] = payload.completed_date
-        existing_vector = list(row["embedding"]) if row["embedding"] else None
-        if existing_vector: await store_follow_up(follow_up_id, row["contact_id"], data, existing_vector)
-        else: await conn.execute("UPDATE follow_ups SET data = $1, updated_at = NOW() WHERE follow_up_id = $2", _json.dumps(data), follow_up_id)
-        return {"success": True, "follow_up_id": follow_up_id, "status": payload.status}
+        await store_follow_up(follow_up_id, data, None); return {"success": True}
     finally: await conn.close()
-
-@app.post("/follow-ups/search", dependencies=[Depends(require_api_key)])
-async def search_follow_ups(request: SearchRequest):
-    try: return {"query": request.query, "results": await search_follow_ups_by_vector(embed_query(request.query), limit=request.top_k)}
-    except Exception as e: raise HTTPException(status_code=500, detail=str(e))
 
 @app.delete("/follow-up/{follow_up_id}", dependencies=[Depends(require_api_key)])
 async def remove_follow_up(follow_up_id: str):
     await delete_follow_up(follow_up_id); return {"success": True}
 
+@app.post("/follow-ups/search", dependencies=[Depends(require_api_key)])
+async def search_follow_ups(request: SearchRequest):
+    results = await search_follow_ups_by_vector(embed_query(request.query), limit=request.top_k)
+    return {"success": True, "query": request.query, "results": results}
+
+# ════════════════════════════════════════════════════════════════════════════
+# EVENTS
+# ════════════════════════════════════════════════════════════════════════════
+
 @app.get("/events", dependencies=[Depends(require_api_key)])
-async def list_events(type: Optional[str] = None, venture: Optional[str] = None):
-    data = await get_all_events(event_type=type, venture=venture); return {"success": True, "data": data, "count": len(data)}
+async def list_events(venture: Optional[str] = None):
+    data = await get_all_events(venture=venture); return {"success": True, "data": data, "count": len(data)}
 
 @app.get("/event/{event_id}", dependencies=[Depends(require_api_key)])
 async def get_event_by_id(event_id: str):
     data = await get_event(event_id)
     if not data: raise HTTPException(status_code=404, detail="Event not found")
     guests = await get_guests_for_event(event_id)
-    return {"success": True, "data": data, "guests": guests, "guest_summary": {"total": len(guests), "confirmed": sum(1 for g in guests if g.get("guest_status") == "Confirmed"), "attended": sum(1 for g in guests if g.get("guest_status") == "Attended")}}
+    return {"success": True, "data": data, "guests": guests}
 
 @app.post("/event", dependencies=[Depends(require_api_key)])
 async def create_event(payload: EventPayload):
@@ -1109,43 +1068,41 @@ async def create_event(payload: EventPayload):
 
 @app.put("/event/{event_id}", dependencies=[Depends(require_api_key)])
 async def update_event(event_id: str, payload: EventPayload):
-    existing = await get_event(event_id)
-    if not existing: raise HTTPException(status_code=404, detail="Event not found")
-    data = {**existing, **{k: v for k, v in payload.dict().items() if v is not None and v != ""}}; data["event_id"] = event_id
+    data = payload.dict(); data["event_id"] = event_id
     await upsert_event(event_id, data); return {"success": True}
 
 @app.patch("/event/{event_id}/status", dependencies=[Depends(require_api_key)])
 async def update_event_status(event_id: str, payload: EventStatusUpdate):
-    existing = await get_event(event_id)
-    if not existing: raise HTTPException(status_code=404, detail="Event not found")
-    existing["status"] = payload.status; await upsert_event(event_id, existing)
-    return {"success": True, "event_id": event_id, "status": payload.status}
+    from db import _conn; import json as _json; conn = await _conn()
+    try:
+        row = await conn.fetchrow("SELECT data FROM events WHERE event_id = $1", event_id)
+        if not row: raise HTTPException(status_code=404, detail="Event not found")
+        data = _json.loads(row["data"]); data["status"] = payload.status
+        await upsert_event(event_id, data); return {"success": True}
+    finally: await conn.close()
 
 @app.delete("/event/{event_id}", dependencies=[Depends(require_api_key)])
 async def remove_event(event_id: str):
     await delete_event(event_id); return {"success": True}
 
-@app.post("/event-guest", dependencies=[Depends(require_api_key)])
-async def add_event_guest(payload: EventGuestPayload):
-    guest_id = payload.guest_id or f"GST-{int(time.time() * 1000)}"; data = payload.dict(); data["guest_id"] = guest_id
-    await upsert_event_guest(guest_id, payload.event_id, data); return {"success": True, "guest_id": guest_id}
+@app.post("/event/{event_id}/guests", dependencies=[Depends(require_api_key)])
+async def add_event_guest(event_id: str, payload: EventGuestPayload):
+    guest_id = payload.guest_id or f"EG-{int(time.time() * 1000)}"; data = payload.dict(); data["guest_id"] = guest_id; data["event_id"] = event_id
+    await upsert_event_guest(guest_id, event_id, data); return {"success": True, "guest_id": guest_id}
 
-@app.patch("/event-guest/{guest_id}", dependencies=[Depends(require_api_key)])
-async def update_event_guest(guest_id: str, payload: EventGuestUpdate):
+@app.patch("/event/{event_id}/guests/{guest_id}", dependencies=[Depends(require_api_key)])
+async def update_event_guest(event_id: str, guest_id: str, payload: EventGuestUpdate):
     from db import _conn; import json as _json; conn = await _conn()
     try:
-        row = await conn.fetchrow("SELECT data, event_id FROM event_guests WHERE guest_id = $1", guest_id)
+        row = await conn.fetchrow("SELECT data FROM event_guests WHERE guest_id = $1", guest_id)
         if not row: raise HTTPException(status_code=404, detail="Guest not found")
         data = _json.loads(row["data"])
-        if payload.guest_status: data["guest_status"] = payload.guest_status
-        if payload.notes: data["notes"] = payload.notes
-        await upsert_event_guest(guest_id, row["event_id"], data); return {"success": True}
+        if payload.role is not None: data["role"] = payload.role
+        if payload.guest_status is not None: data["guest_status"] = payload.guest_status
+        if payload.notes is not None: data["notes"] = payload.notes
+        await upsert_event_guest(guest_id, event_id, data); return {"success": True}
     finally: await conn.close()
 
-@app.delete("/event-guest/{guest_id}", dependencies=[Depends(require_api_key)])
-async def remove_event_guest(guest_id: str):
+@app.delete("/event/{event_id}/guests/{guest_id}", dependencies=[Depends(require_api_key)])
+async def remove_event_guest(event_id: str, guest_id: str):
     await delete_event_guest(guest_id); return {"success": True}
-
-@app.get("/event/{event_id}/guests", dependencies=[Depends(require_api_key)])
-async def list_event_guests(event_id: str):
-    data = await get_guests_for_event(event_id); return {"success": True, "data": data, "count": len(data)}
